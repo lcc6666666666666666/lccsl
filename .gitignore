@@ -1,0 +1,12 @@
+.venv/
+.tools/
+.runtime/
+.env
+node_modules/
+dist/
+__pycache__/
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+test-results/
