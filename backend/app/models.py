@@ -185,6 +185,18 @@ class LegacyCatalog(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     document: Mapped[dict] = mapped_column(JSON)
 
+class FileCatalog(Base):
+    """Durable, read-only adapter snapshot from an administrator supplied file."""
+    __tablename__ = 'file_catalog'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    revision: Mapped[str] = mapped_column(String(32))
+    filename: Mapped[str] = mapped_column(String(128))
+    sha256: Mapped[str] = mapped_column(String(64))
+    source: Mapped[dict] = mapped_column(JSON)
+    document: Mapped[dict] = mapped_column(JSON)
+    imported_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    imported_by: Mapped[int] = mapped_column(ForeignKey('users.id'))
+
 class BillingReceipt(Base):
     __tablename__ = 'billing_receipts'
     event_id: Mapped[str] = mapped_column(String(36), primary_key=True)

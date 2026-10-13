@@ -12,6 +12,7 @@ from .config import settings, PROJECT
 from .db import engine
 from .errors import DomainError
 from .api import router
+from .catalog_import import IMPORT_PATHS
 from .validation_messages import validation_details, validation_message, unique_person_conflict, field_detail
 
 @asynccontextmanager
@@ -53,13 +54,15 @@ async def boundaries(request:Request,call_next):
             return error(request,'ORIGIN_INVALID','当前页面来源不受信任，修改请求已拒绝。请使用系统启动后提供的地址打开页面，重新登录后操作',403)
         if request.headers.get('content-type','').split(';')[0].strip().lower() != 'application/json':
             return error(request,'CONTENT_TYPE_INVALID','请求必须使用JSON格式，请刷新页面重试；接口调用请设置Content-Type为application/json',415)
+        limit=2*1024*1024 if request.url.path in IMPORT_PATHS else 65536
+        limit_label='2MB' if limit>65536 else '64KB'
         length=request.headers.get('content-length','0')
-        if not length.isascii() or not length.isdecimal() or len(length)>10 or int(length)>65536:
-            return error(request,'REQUEST_TOO_LARGE','请求长度不正确或超过64KB限制，请减少一次提交的数据；接口调用请检查Content-Length',413)
+        if not length.isascii() or not length.isdecimal() or len(length)>10 or int(length)>limit:
+            return error(request,'REQUEST_TOO_LARGE',f'请求长度不正确或超过{limit_label}限制，请减少一次提交的数据；接口调用请检查Content-Length',413)
         body=bytearray()
         async for chunk in request.stream():
-            if len(body)+len(chunk)>65536:
-                return error(request,'REQUEST_TOO_LARGE','请求内容超过64KB限制，请减少一次提交的数据后重试',413)
+            if len(body)+len(chunk)>limit:
+                return error(request,'REQUEST_TOO_LARGE',f'请求内容超过{limit_label}限制，请减少一次提交的数据后重试',413)
             body.extend(chunk)
         request._body=bytes(body)
     response=await call_next(request)

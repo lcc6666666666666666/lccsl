@@ -1,0 +1,38 @@
+{
+  "format_version": 1,
+  "semester_code": "CURRENT",
+  "courses": [
+    {
+      "code": "EXT101",
+      "name": "Python应用开发",
+      "department": "计算机科学与技术学院",
+      "credits": "3.0",
+      "description": "使用Python实现实际应用，练习模块设计与自动化测试。",
+      "prerequisites": []
+    },
+    {
+      "code": "EXT102",
+      "name": "Web应用开发进阶",
+      "department": "计算机科学与技术学院",
+      "credits": "3.0",
+      "description": "基于Web接口构建应用，需要通过Python应用开发。",
+      "prerequisites": ["EXT101"]
+    }
+  ],
+  "offerings": [
+    {
+      "code": "EXT101-2-01",
+      "course_code": "EXT101",
+      "fee": "600.00",
+      "capacity": 10,
+      "meetings": [{"weekday": 1, "start": "14:00", "end": "15:40", "week_start": 1, "week_end": 16, "room": "实验楼B201"}]
+    },
+    {
+      "code": "EXT102-2-01",
+      "course_code": "EXT102",
+      "fee": "600.00",
+      "capacity": 10,
+      "meetings": [{"weekday": 2, "start": "14:00", "end": "15:40", "week_start": 1, "week_end": 16, "room": "实验楼B202"}]
+    }
+  ]
+}

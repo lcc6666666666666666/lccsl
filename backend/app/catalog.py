@@ -11,7 +11,7 @@ from sqlalchemy import create_engine, text, select
 from sqlalchemy.dialects.mysql import insert
 from .config import settings
 from .db import SessionLocal, utcnow, database_connect_args
-from .models import CatalogCache, Course, Semester, Meeting, Offering, Prerequisite
+from .models import CatalogCache, Course, Semester, Meeting, Offering, Prerequisite, FileCatalog
 from .errors import DomainError
 
 class HttpCatalogAdapter:
@@ -70,6 +70,7 @@ class SQLCatalogAdapter:
 
 _cache_lock=threading.Lock()
 _memory_document=None
+_memory_source=None
 _memory_deadline=0.0
 _failure_deadline=0.0
 _structure_lock=threading.Lock()
@@ -166,18 +167,37 @@ def offering_structure(db,semester_id,document):
         return _structures[semester_id]
 
 def clear_memory_cache():
-    global _memory_document,_memory_deadline,_failure_deadline
+    global _memory_document,_memory_deadline,_failure_deadline,_memory_source
     _memory_document=None
+    _memory_source=None
     _memory_deadline=_failure_deadline=0.0
 
 def ensure_catalog():
-    global _memory_document,_memory_deadline,_failure_deadline
-    if _memory_document is not None and time.monotonic()<_memory_deadline:
+    global _memory_document,_memory_deadline,_failure_deadline,_memory_source
+    # Check the durable revision on every call, including across API workers.
+    # Imported file snapshots are immutable between revisions and need no network.
+    with SessionLocal() as db:
+        revision=db.scalar(select(FileCatalog.revision).where(FileCatalog.id==1))
+    if revision:
+        if _memory_source==revision and _memory_document is not None:
+            return _memory_document
+        if not _cache_lock.acquire(timeout=7.8):
+            raise DomainError('CATALOG_UNAVAILABLE','文件目录正在刷新，请稍后重试',503)
+        try:
+            with SessionLocal() as db:
+                current=db.get(FileCatalog,1)
+                if current is not None:
+                    _memory_document=validate_catalog_document({**current.document,'file_revision':current.revision})
+                    _memory_source=current.revision
+                    return _memory_document
+        finally:
+            _cache_lock.release()
+    if _memory_source is None and _memory_document is not None and time.monotonic()<_memory_deadline:
         return _memory_document
     if not _cache_lock.acquire(timeout=7.8):
         raise DomainError('CATALOG_UNAVAILABLE','课程目录刷新等待超时，暂时无法核验最新课程信息；请稍后刷新重试，持续失败时请联系教务管理员检查目录服务',503)
     try:
-        if _memory_document is not None and time.monotonic()<_memory_deadline:
+        if _memory_source is None and _memory_document is not None and time.monotonic()<_memory_deadline:
             return _memory_document
         if time.monotonic()<_failure_deadline:
             raise DomainError('CATALOG_UNAVAILABLE','外部课程目录刚刚访问失败，且当前没有有效缓存；请稍后刷新重试，持续失败时请联系教务管理员检查目录服务',503)
@@ -187,6 +207,7 @@ def ensure_catalog():
             _failure_deadline=time.monotonic()+1
             raise
         _memory_document=document
+        _memory_source=None
         _memory_deadline=time.monotonic()+max(0,(expires-utcnow()).total_seconds())
         return document
     finally:
@@ -210,6 +231,11 @@ def _read_catalog():
         # meetings and prices); display metadata comes from the read-only source.
         # Shared semester locks serialize this refresh with final billing.
         list(db.scalars(select(Semester).order_by(Semester.id).with_for_update(read=True,nowait=True)))
+        current=db.get(FileCatalog,1)
+        if current is not None:
+            # A file import may have committed while the external read was pending.
+            # Never apply the older HTTP/SQL display data over that snapshot.
+            return validate_catalog_document(current.document),utcnow()+timedelta(seconds=settings().catalog_cache_seconds)
         incoming={row['id']:row for row in document['courses']}
         for course in db.scalars(select(Course).where(Course.id.in_(sorted(incoming))).order_by(Course.id).with_for_update(nowait=True)):
             entry=incoming[course.id]

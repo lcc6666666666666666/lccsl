@@ -25,4 +25,14 @@ os.environ['DATABASE_URL']=url.set(username=username,password=password).render_a
 from alembic.config import Config
 from alembic import command
 command.upgrade(Config(str(ROOT/'backend/alembic.ini')),'head')
+# Existing native installations use per-table grants, so a new table also needs
+# an explicit grant. Never expand access to the legacy or billing source tables.
+from sqlalchemy import text
+from backend.app.db import engine
+if not url.database or not url.database.replace('_','').isalnum():
+    raise SystemExit('Unsafe project database name; grants not changed')
+with engine.begin() as connection:
+    accounts=connection.execute(text('SELECT User,Host FROM mysql.user WHERE User=:name'),{'name':url.username}).all()
+    for account,host in accounts:
+        connection.execute(text(f'GRANT SELECT,INSERT,UPDATE,DELETE ON `{url.database}`.`file_catalog` TO :name@:host'),{'name':account,'host':host})
 print('项目数据库迁移完成。')

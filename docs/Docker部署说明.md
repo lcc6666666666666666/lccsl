@@ -106,7 +106,7 @@ docker compose --env-file .runtime/docker/compose.env -f compose.yaml ps -a
 docker compose --env-file .runtime/docker/compose.env -f compose.yaml logs --tail 100 init api mysql catalog billing worker
 ```
 
-当前目录文件导入功能按要求暂停；Docker 部署初始化的是项目既有演示课程目录，不包含管理员文件导入入口。
+管理员登录后可以使用“课程文件导入”，上传 JSON 文件作为外部课程目录数据源。文件原始对象及合并目录保存在 MySQL 数据卷中的 `file_catalog` 表，重启后继续有效；未导入时继续使用目录模拟服务。Docker 初始化器自动执行 `0003_file_catalog` 迁移并授予业务账户新表权限。格式及示例见 [课程文件导入说明](课程文件导入说明.md)。
 
 ## 6. 验证范围
 

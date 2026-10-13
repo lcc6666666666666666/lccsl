@@ -10,11 +10,13 @@
 - 初始账号位于 **`.runtime/docker/accounts/演示账号.txt`**，首次登录须修改密码。
 - 再次运行保留数据库、业务数据和密码；双击 **Docker停止.cmd** 停止容器并保留数据卷。
 - Linux/macOS：`bash scripts/docker_deploy.sh`；停止：`bash scripts/docker_deploy.sh --stop`。
-- Docker 数据独立于原本的本机运行环境。课程目录文件导入暂未启用；目录模拟服务随容器一起启动。
+- Docker 数据独立于原本的本机运行环境。管理员可在“课程文件导入”上传外部 JSON 目录；未导入时使用目录模拟服务。
 
 参数、故障处理、数据保存位置及验证范围见 [Docker 部署说明](docs/Docker部署说明.md)。
 
 ## 在当前电脑使用
+
+管理员新增功能：进入 **课程文件导入**，选择学期与 [课程目录示例.json](数据导入/课程目录示例.json)，点击 **一键导入**。也可以先下载当前学期示例、编辑后导入，或仅校验预览。支持课程、教学班、先修关系和上课时间；同批有错全部不保存，重复数据跳过。详见 [课程文件导入说明](docs/课程文件导入说明.md)。
 
 1. 双击 **启动系统.cmd**，或在 PowerShell 中运行 `powershell -ExecutionPolicy Bypass -File .\scripts\start.ps1`。
 2. 打开 **http://127.0.0.1:8000**。

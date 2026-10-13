@@ -6,13 +6,14 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select, func, delete, text
 from sqlalchemy.orm import Session
 from .db import get_db, utcnow
-from .models import User, LoginSession, Semester, Course, Offering, Meeting, Prerequisite, Qualification, Schedule, Enrollment, Alternate, Invoice, Outbox, Audit
+from .models import User, LoginSession, Semester, Course, Offering, Meeting, Prerequisite, Qualification, Schedule, Enrollment, Alternate, Invoice, Outbox, Audit, FileCatalog
 from .schemas import Login, PasswordChange, ScheduleInput, VersionInput, TeachingInput, GradesInput, PersonCreate, PersonInput, SemesterInput, validate_identity_number
 from .security import principal, role, authenticate, public_user, digest, password_hasher, encrypt_identity, identity_fingerprint, masked_identity, decrypt_identity
 from .errors import require, DomainError
-from .catalog import ensure_catalog,offering_structure
+from .catalog import ensure_catalog,offering_structure,validate_catalog_document
 from .validation_messages import field_detail
 from . import services as svc
+from . import catalog_import as catalog_files
 
 router = APIRouter(prefix='/api/v1')
 DB = Annotated[Session, Depends(get_db)]
@@ -77,6 +78,12 @@ def courses(p:P,db:DB):
 @router.get('/catalog/offerings')
 def offerings(p:P,db:DB,semester_id:int,q:str=Query(default='',max_length=100),page:int=Query(default=1,ge=1),page_size:int=Query(default=100,ge=1,le=100)):
     document=ensure_catalog()
+    # Keep the cached structure and live offerings in the same import generation.
+    # Fetch upstream before retaining a connection/lock while waiting on I/O.
+    db.scalar(select(Semester).where(Semester.id==semester_id).with_for_update(read=True,nowait=True))
+    revision=db.scalar(select(FileCatalog.revision).where(FileCatalog.id==1))
+    if revision and document.get('file_revision')!=revision:
+        document=validate_catalog_document(db.get(FileCatalog,1).document)
     structure=offering_structure(db,semester_id,document)
     query=select(Offering,User.name,func.count().over().label('total')).select_from(Offering).outerjoin(User,User.id==Offering.professor_id).where(Offering.semester_id==semester_id)
     if q:
@@ -191,6 +198,30 @@ def person_view(db,u):
             'identity_needs_correction':not identity or not u.birth_date or identity[6:14]!=u.birth_date.strftime('%Y%m%d'),
             'status':u.status,'department':u.department,'graduation_date':u.graduation_date,'active':u.active,'version':u.version,
             'qualification_ids':list(db.scalars(select(Qualification.course_id).where(Qualification.professor_id==u.id))) if u.role=='professor' else []}
+
+@router.get('/registrar/catalog/source')
+def catalog_source(p:P,db:DB):
+    role(p,'registrar')
+    return catalog_files.source_status(db)
+
+@router.get('/registrar/catalog/template')
+def catalog_template(p:P,db:DB,semester_id:int):
+    role(p,'registrar')
+    term=db.get(Semester,semester_id)
+    require(term,'SEMESTER_NOT_FOUND','所选学期不存在，请重新选择',404)
+    return catalog_files.example_document(term)
+
+@router.post('/registrar/catalog/preview')
+def preview_catalog(data:catalog_files.ImportRequest,p:P,db:DB):
+    role(p,'registrar')
+    return catalog_files.import_file(db,p.id,data,preview=True)
+
+@router.post('/registrar/catalog/import')
+def import_catalog(data:catalog_files.ImportRequest,p:P,db:DB):
+    role(p,'registrar')
+    result=catalog_files.import_file(db,p.id,data)
+    db.commit()
+    return result
 
 @router.get('/registrar/people/{kind}')
 def people(kind:str,p:P,db:DB,q:str=Query(default='',max_length=100),page:int=Query(default=1,ge=1),page_size:int=Query(default=20,ge=1,le=100),include_inactive:bool=False):

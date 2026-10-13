@@ -7,7 +7,7 @@ import {Reading,User,School,Calendar,Document,Connection,Lock,SwitchButton} from
 const route=useRoute(),auth=useAuth()
 const bare=computed(()=>['/login','/password'].includes(route.path))
 const roleNames={student:'学生工作台',professor:'教授工作台',registrar:'教务管理台'}
-const menus=computed(()=>auth.user?.role==='registrar'?[['/registrar','学期与选课',Calendar],['/registrar/students','学生信息',User],['/registrar/professors','教授信息',School],['/registrar/billing','计费任务',Connection],['/registrar/audit','操作记录',Document]]:[[roleHome(auth.user?.role||'student'),auth.user?.role==='student'?'我的选课与成绩':'任课与成绩管理',Reading]])
+const menus=computed(()=>auth.user?.role==='registrar'?[['/registrar','学期与选课',Calendar],['/registrar/catalog','课程文件导入',Reading],['/registrar/students','学生信息',User],['/registrar/professors','教授信息',School],['/registrar/billing','计费任务',Connection],['/registrar/audit','操作记录',Document]]:[[roleHome(auth.user?.role||'student'),auth.user?.role==='student'?'我的选课与成绩':'任课与成绩管理',Reading]])
 const logoutPending=ref(false),logoutError=ref('')
 async function logout(){if(logoutPending.value)return;logoutPending.value=true;logoutError.value='';try{await auth.logout();await router.push('/login')}catch(e:any){logoutError.value=`退出登录未完成：${e.message}。恢复连接后请再次点击“退出”。`}finally{logoutPending.value=false}}
 </script>
