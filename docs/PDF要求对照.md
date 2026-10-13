@@ -30,7 +30,7 @@
 | 15：选课用例前置登录、失败不改变原数据 | 统一身份依赖；同一业务事务 | 权限测试、选课失败回滚测试 |
 | 16～17：有资格的课程、已有任课、选择/取消、冲突指出教学班 | 资格列表、任课原集合校验、时间检查及冲突教学班代码 | `test_teaching_eligibility_conflicts_and_ownership`、`test_concurrent_professor_claim`；教授浏览器流程 |
 | 16：无课程、目录故障、选课关闭 | 空列表提示、503 提示、关闭学期只读 | 教授资格与空历史列表测试、目录故障测试、关闭测试 |
-| 18：上一学期名单、A/B/C/D/F/I、空白、修改、无任课 | 本人已结束教学班名单、批量成绩与版本校验、无任课空态 | `test_grades_allowed_null_version_and_atomicity`、教授浏览器录入流程 |
+| 18：上一学期名单、A/B/C/D/F/I、空白、修改、无任课 | 本人已结课教学班名单、批量成绩与版本校验；按用户补充需求增加管理员手动结课入口，区分结束选课与结束教学 | `test_grades_allowed_null_version_and_atomicity`、`test_semester_completion.py`、`browser_semester_completion_test.py` |
 | 19：本人上一学期成绩、无成绩提示、只读 | 默认最近结束学期；可切换；空数据提示 | `test_catalog_pagination_search_and_report`、`test_cannot_choose_another_student`；学生成绩界面 |
 
 补充安全与可靠性测试覆盖身份号码加密/脱敏、密码哈希与会话撤销、初始密码强制更新、CSRF/Origin、过期会话、参数白名单、幂等键内容冲突、成绩批量回滚、重复事件和唯一正式账单。功能测试不等同于安全认证；验收记录注明实际扫描范围。

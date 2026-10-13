@@ -1,18 +1,39 @@
 <script setup lang="ts">
-import {computed,onMounted,ref,watch} from 'vue'
+import {computed,onMounted,onUnmounted,ref,watch} from 'vue'
 import {ElMessage,ElMessageBox} from 'element-plus'
 import {Refresh} from '@element-plus/icons-vue'
-import {api,allOfferings,meetingText,stateLabel,type Semester,type Offering} from '../api'
+import {api,allOfferings,meetingText,stateLabel,type Semester,type Offering,type CourseStatusItem} from '../api'
 import Timetable from '../components/Timetable.vue'
+import CourseStatus from '../components/CourseStatus.vue'
 const terms=ref<Semester[]>([]),termId=ref<number>(),offers=ref<Offering[]>([]),chosen=ref<number[]>([]),expected=ref<number[]>([]),busy=ref(false),error=ref(''),query=ref(''),page=ref(1)
 const rosterOpen=ref(false),roster=ref<any[]>([]),active=ref<Offering>(),canGrade=ref(false),loading=ref(false)
-const gradeError=ref('')
+const gradeError=ref(''),gradingMessage=ref('')
+const tab=ref('manage'),statusItems=ref<CourseStatusItem[]>([]),effectiveIds=ref<number[]>([]),editingExpected=ref<number[]>([]),syncNotice=ref('')
+const dirty=computed(()=>chosen.value.length!==editingExpected.value.length||chosen.value.some(id=>!editingExpected.value.includes(id)))
 const current=computed(()=>terms.value.find(t=>t.id===termId.value))
-const mine=computed(()=>offers.value.filter(o=>expected.value.includes(o.id)))
+const mine=computed(()=>offers.value.filter(o=>effectiveIds.value.includes(o.id)&&o.state!=='CANCELLED'))
 const filtered=computed(()=>offers.value.filter(o=>(current.value?.can_register?(o.eligible||expected.value.includes(o.id)):expected.value.includes(o.id))&&`${o.name} ${o.code}`.includes(query.value)))
 watch(query,()=>page.value=1)
 let loadSequence=0
-async function load(){if(!termId.value)return;const sequence=++loadSequence,id=termId.value;loading.value=true;error.value='';try{const [all,t,newTerms]=await Promise.all([allOfferings(id),api(`/professor/teaching/${id}`),api<Semester[]>('/semesters')]);if(sequence!==loadSequence)return;offers.value=all;chosen.value=[...t.offering_ids];expected.value=[...t.offering_ids];terms.value=newTerms}catch(e:any){if(sequence===loadSequence)error.value=e.message}finally{if(sequence===loadSequence)loading.value=false}}
+async function load(preserveEdits=false,background=false){
+  if(!termId.value)return
+  const sequence=++loadSequence,id=termId.value
+  if(!background){loading.value=true;error.value=''}
+  try{
+    const [t,newTerms]=await Promise.all([api(`/professor/teaching-status/${id}`),api<Semester[]>('/semesters')])
+    if(sequence!==loadSequence||id!==termId.value||(background&&busy.value))return
+    const keep=preserveEdits&&dirty.value&&t.semester.state==='OPEN'
+    const changed=JSON.stringify(statusItems.value)!==JSON.stringify(t.items)
+    if(preserveEdits&&changed)syncNotice.value=keep?'任课状态已更新，未保存的调整已保留；保存时会再次检查任课冲突。':'任课结果已同步；被取消的教学班已从授课时间表移除，详细原因见“任课状态”。'
+    statusItems.value=t.items;effectiveIds.value=t.effective_ids;expected.value=[...t.offering_ids]
+    if(!keep){chosen.value=[...t.offering_ids];editingExpected.value=[...t.offering_ids]}
+    terms.value=newTerms.map(term=>term.id===id?t.semester:term);error.value=''
+    if(tab.value==='manage'){
+      const all=await allOfferings(id)
+      if(sequence===loadSequence&&id===termId.value&&!(background&&busy.value))offers.value=all
+    }
+  }catch(e:any){if(sequence===loadSequence)error.value=e.message}finally{if(sequence===loadSequence&&!background)loading.value=false}
+}
 async function refresh(){
   if(busy.value||loading.value)return
   if(chosen.value.length!==expected.value.length||chosen.value.some(id=>!expected.value.includes(id))){
@@ -20,17 +41,42 @@ async function refresh(){
   }
   await load()
 }
-watch(termId,()=>{page.value=1;offers.value=[];chosen.value=[];expected.value=[];load()})
-async function save(){if(busy.value)return;busy.value=true;error.value='';try{await api(`/professor/teaching/${termId.value}`,'PUT',{offering_ids:chosen.value,expected_ids:expected.value});ElMessage.success('任课安排已更新');await load()}catch(e:any){error.value=e.message}finally{busy.value=false}}
-async function showRoster(o:Offering){active.value=o;busy.value=true;error.value='';gradeError.value='';try{const result=await api(`/professor/offerings/${o.id}/roster`);roster.value=result.items;canGrade.value=result.can_grade;rosterOpen.value=true}catch(e:any){error.value=e.message}finally{busy.value=false}}
-async function saveGrades(){if(busy.value)return;gradeError.value='';if(!roster.value.length){gradeError.value='当前名单没有可录入成绩的学生，请关闭名单并刷新教学班后再试。';return}busy.value=true;try{const result=await api(`/professor/offerings/${active.value!.id}/grades`,'PUT',{grades:roster.value.map(r=>({student_id:r.student_id,grade:r.grade||null,version:r.version}))});roster.value=result.items;ElMessage.success('成绩已保存')}catch(e:any){gradeError.value=e.message}finally{busy.value=false}}
+watch(termId,()=>{page.value=1;offers.value=[];chosen.value=[];expected.value=[];editingExpected.value=[];statusItems.value=[];effectiveIds.value=[];syncNotice.value='';load()})
+watch(tab,()=>load(true))
+async function save(){if(busy.value)return;busy.value=true;loadSequence+=1;loading.value=false;error.value='';try{await api(`/professor/teaching/${termId.value}`,'PUT',{offering_ids:chosen.value,expected_ids:editingExpected.value});ElMessage.success('任课安排已更新');await load()}catch(e:any){error.value=e.message}finally{busy.value=false}}
+function applyGrading(result:any){
+  canGrade.value=result.can_grade;gradingMessage.value=result.grading_message
+  terms.value=terms.value.map(t=>t.id===result.semester.id?result.semester:t)
+}
+async function showRoster(o:Offering){active.value=o;busy.value=true;error.value='';gradeError.value='';try{const result=await api(`/professor/offerings/${o.id}/roster`);roster.value=result.items;applyGrading(result);rosterOpen.value=true}catch(e:any){error.value=e.message}finally{busy.value=false}}
+async function saveGrades(){if(busy.value)return;gradeError.value='';if(!canGrade.value){gradeError.value=gradingMessage.value;return}if(!roster.value.length){gradeError.value='当前名单没有可录入成绩的学生，请关闭名单并刷新教学班后再试。';return}busy.value=true;try{const result=await api(`/professor/offerings/${active.value!.id}/grades`,'PUT',{grades:roster.value.map(r=>({student_id:r.student_id,grade:r.grade||null,version:r.version}))});roster.value=result.items;applyGrading(result);ElMessage.success('成绩已保存')}catch(e:any){gradeError.value=e.message}finally{busy.value=false}}
 onMounted(async()=>{try{terms.value=await api('/semesters');termId.value=terms.value.find(t=>t.can_register)?.id??terms.value[0]?.id}catch(e:any){error.value=e.message}})
+let timer:ReturnType<typeof setInterval>|undefined,polling=false
+onMounted(()=>{timer=setInterval(async()=>{
+  if(polling||busy.value||loading.value||document.hidden)return
+  polling=true
+  try{
+    if(rosterOpen.value&&active.value){
+      const id=active.value.id,result=await api(`/professor/offerings/${id}/roster`)
+      if(busy.value||!rosterOpen.value||id!==active.value?.id)return
+      // Unlock live when the admin completes the semester, without overwriting
+      // unsaved grades or their versions once this dialog is editable.
+      if(!canGrade.value&&result.can_grade)roster.value=result.items
+      applyGrading(result)
+    }else await load(true,true)
+  }catch(e:any){gradeError.value=e.message;if(e.code==='OFFERING_NOT_FOUND')canGrade.value=false}
+  finally{polling=false}
+},5000)})
+onUnmounted(()=>clearInterval(timer))
 </script>
 <template><div v-loading="loading"><div class="page-heading"><div><div class="eyebrow">TEACHING WORKSPACE</div><h1>有序安排每一堂课</h1><p class="muted">选择任课教学班，管理学生名单与学期成绩。</p></div><el-select v-model="termId" :disabled="busy||loading" aria-label="选择学期" class="term-select"><el-option v-for="t in terms" :key="t.id" :label="t.name" :value="t.id"/></el-select></div>
   <el-alert v-if="error" :title="error" type="error" :closable="false" class="mb"/>
-  <div class="stat-grid"><div class="stat-card"><span>本学期任课</span><strong>{{mine.length}} <em>个教学班</em></strong><small>正式保存后生效</small></div><div class="stat-card"><span>在班学生</span><strong>{{mine.reduce((a,o)=>a+o.enrolled_count,0)}} <em>人次</em></strong><small>仅可管理本人教学班</small></div><div class="stat-card"><span>学期状态</span><strong>{{current?.completed?'已结课':current?stateLabel(current.state):'加载中'}}</strong><small>{{current?.completed?'可录入与修改成绩':'学期结束后开放成绩录入'}}</small></div></div>
-  <section class="panel mb"><div class="panel-heading"><h2>{{current?.can_register?'选择授课课程':'教学班与学生名单'}}</h2><div class="toolbar"><el-button :icon="Refresh" :disabled="busy||loading" @click="refresh">刷新</el-button><el-input v-model="query" aria-label="搜索教学班" placeholder="搜索课程或教学班" clearable/><el-button v-if="current?.can_register" type="primary" :loading="busy" @click="save">保存任课安排</el-button></div></div><p class="muted">{{current?.can_register?'勾选具备授课资格的教学班；取消勾选可退出任课。保存时检查上课时间冲突。':'选课结束后任课安排已锁定。选择已结束学期，可进入名单录入成绩。'}}</p>
-    <el-table :data="filtered.slice((page-1)*8,page*8)" :empty-text="current?.can_register?'没有具备任课资格的教学班':'本学期没有任课教学班'"><el-table-column v-if="current?.can_register" label="任课" width="70"><template #default="{row}"><el-checkbox :model-value="chosen.includes(row.id)" :aria-label="`选择任课 ${row.name}`" :disabled="busy||!row.eligible||row.state!=='OPEN'||(row.professor_id!==null&&!expected.includes(row.id))" @change="(value: boolean | string | number)=>chosen=value?[...chosen,row.id]:chosen.filter(x=>x!==row.id)"/></template></el-table-column><el-table-column label="课程" min-width="170"><template #default="{row}"><b>{{row.name}}</b><div class="subtle">{{row.course_code}} · {{row.code}}</div></template></el-table-column><el-table-column label="上课安排" min-width="240"><template #default="{row}">{{meetingText(row)}}</template></el-table-column><el-table-column prop="professor_name" label="授课教授" width="110"/><el-table-column label="人数" width="90"><template #default="{row}">{{row.enrolled_count}} / 10</template></el-table-column><el-table-column label="状态" width="100"><template #default="{row}"><el-tag effect="plain">{{stateLabel(row.state)}}</el-tag></template></el-table-column><el-table-column label="操作" width="150"><template #default="{row}"><el-button v-if="expected.includes(row.id)" text type="primary" :disabled="busy" @click="showRoster(row)">{{current?.completed?'名单与成绩':'查看名单'}}</el-button></template></el-table-column></el-table><el-pagination v-model:current-page="page" :page-size="8" :total="filtered.length" layout="prev,pager,next" hide-on-single-page/>
-  </section><section class="panel"><div class="panel-heading"><h2>我的授课时间表</h2></div><Timetable v-if="mine.length" :offerings="mine"/><el-empty v-else description="本学期暂无任课安排"/></section>
-  <el-dialog v-model="rosterOpen" :title="`${active?.name||''} · 学生名单`" width="700px" :close-on-click-modal="false"><el-alert v-if="gradeError" :title="gradeError" type="error" :closable="false" show-icon class="mb"/><el-alert v-if="!canGrade" title="此教学班尚未结束或已取消，当前仅可查看名单。" type="info" :closable="false" class="mb"/><el-table :data="roster" empty-text="暂无注册学生"><el-table-column prop="student_id" label="学生编号"/><el-table-column prop="name" label="姓名"/><el-table-column prop="username" label="账号"/><el-table-column label="成绩" width="160"><template #default="{row}"><el-select v-model="row.grade" :aria-label="`${row.name}的成绩`" clearable placeholder="待录入" :disabled="!canGrade||busy"><el-option v-for="g in ['A','B','C','D','F','I']" :key="g" :value="g" :label="g"/></el-select></template></el-table-column></el-table><template #footer><el-button @click="rosterOpen=false">关闭</el-button><el-button v-if="canGrade&&roster.length" type="primary" :loading="busy" @click="saveGrades">保存成绩</el-button></template></el-dialog>
+  <el-alert v-if="syncNotice" :title="syncNotice" type="info" show-icon class="mb" @close="syncNotice=''"/>
+  <el-tabs v-model="tab" class="workspace-tabs" :before-leave="()=>!busy"><el-tab-pane label="任课安排" name="manage"/><el-tab-pane label="任课状态" name="status"/></el-tabs>
+  <section v-if="tab==='status'" class="panel mb"><div class="panel-heading"><h2>我的任课状态</h2><el-button :icon="Refresh" :disabled="busy||loading" @click="load(true)">刷新状态</el-button></div><p class="muted">任课提交成功即完成认领，结束选课时才确认开班。此处保留已取消或已退出的任课记录，每5秒同步结果；尚未保存的勾选不计为申请成功。</p><CourseStatus :items="statusItems" teaching/></section>
+  <div class="stat-grid"><div class="stat-card"><span>本学期任课</span><strong>{{effectiveIds.length}} <em>个教学班</em></strong><small>仅统计当前有效任课，已取消教学班不计入</small></div><div class="stat-card"><span>在班学生</span><strong>{{statusItems.filter(i=>i.effective).reduce((a,i)=>a+(i.enrolled_count||0),0)}} <em>人次</em></strong><small>仅可管理本人教学班</small></div><div class="stat-card"><span>学期状态</span><strong>{{current?.completed?'已结课':current?stateLabel(current.state):'加载中'}}</strong><small>{{current?.completed?'可录入与修改成绩':'管理员结课或计划学期结束后开放成绩录入'}}</small></div></div>
+  <section v-if="tab==='manage'" class="panel mb"><div class="panel-heading"><h2>{{current?.can_register?'选择授课课程':'教学班与学生名单'}}</h2><div class="toolbar"><el-button :icon="Refresh" :disabled="busy||loading" @click="refresh">刷新</el-button><el-input v-model="query" aria-label="搜索教学班" placeholder="搜索课程或教学班" clearable/><el-button v-if="current?.can_register" type="primary" :loading="busy" @click="save">保存任课安排</el-button></div></div><p class="muted">{{current?.can_register?'勾选具备授课资格的教学班；取消勾选可退出任课。保存时检查上课时间冲突。':'选课结束仅确认开班。管理员结束学期或计划学期结束后，进入“名单与成绩”录入成绩。'}}</p>
+    <el-table :data="filtered.slice((page-1)*8,page*8)" :empty-text="current?.can_register?'没有具备任课资格的教学班':'本学期没有任课教学班'"><el-table-column v-if="current?.can_register" label="任课" width="70"><template #default="{row}"><el-checkbox :model-value="chosen.includes(row.id)" :aria-label="`选择任课 ${row.name}`" :disabled="busy||!row.eligible||row.state!=='OPEN'||(row.professor_id!==null&&!expected.includes(row.id))" @change="(value: boolean | string | number)=>chosen=value?[...chosen,row.id]:chosen.filter(x=>x!==row.id)"/></template></el-table-column><el-table-column label="课程" min-width="170"><template #default="{row}"><b>{{row.name}}</b><div class="subtle">{{row.course_code}} · {{row.code}}</div></template></el-table-column><el-table-column label="上课安排" min-width="240"><template #default="{row}">{{meetingText(row)}}</template></el-table-column><el-table-column prop="professor_name" label="授课教授" width="110"/><el-table-column label="人数" width="90"><template #default="{row}">{{row.enrolled_count}} / 10</template></el-table-column><el-table-column label="状态" width="130"><template #default="{row}"><el-tag effect="plain">{{row.state==='CLOSED'?(current?.completed?'已结课':'已确认开班'):stateLabel(row.state)}}</el-tag></template></el-table-column><el-table-column label="操作" width="150"><template #default="{row}"><el-button v-if="expected.includes(row.id)" text type="primary" :disabled="busy" @click="showRoster(row)">{{row.state==='CLOSED'?'名单与成绩':'查看名单'}}</el-button></template></el-table-column></el-table><el-pagination v-model:current-page="page" :page-size="8" :total="filtered.length" layout="prev,pager,next" hide-on-single-page/>
+  </section><section v-if="tab==='manage'" class="panel"><div class="panel-heading"><h2>我的授课时间表</h2></div><Timetable v-if="mine.length" :offerings="mine"/><el-empty v-else description="本学期暂无任课安排"/></section>
+  <el-dialog v-model="rosterOpen" :title="`${active?.name||''} · 名单与成绩`" width="700px" :close-on-click-modal="false"><el-alert v-if="gradeError" :title="gradeError" type="error" :closable="false" show-icon class="mb"/><el-alert :title="gradingMessage" :type="canGrade?'success':'info'" :closable="false" show-icon class="mb"/><p class="subtle mb">{{current?.name}} · 计划结束日期：{{current?.end_date}}；每5秒同步成绩录入是否开放，保留尚未保存的成绩。</p><el-table :data="roster" empty-text="暂无注册学生"><el-table-column prop="student_id" label="学生编号"/><el-table-column prop="name" label="姓名"/><el-table-column prop="username" label="账号"/><el-table-column label="成绩" width="160"><template #default="{row}"><el-select v-model="row.grade" :aria-label="`${row.name}的成绩`" clearable placeholder="待录入" :disabled="!canGrade||busy"><el-option v-for="g in ['A','B','C','D','F','I']" :key="g" :value="g" :label="g"/></el-select></template></el-table-column></el-table><template #footer><el-button @click="rosterOpen=false">关闭</el-button><el-button v-if="canGrade&&roster.length" type="primary" :loading="busy" @click="saveGrades">保存成绩</el-button></template></el-dialog>
 </div></template>

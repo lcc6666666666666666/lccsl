@@ -1,7 +1,9 @@
 export interface User { id:number; username:string; name:string; role:'student'|'professor'|'registrar'; csrf_token:string; must_change_password:boolean }
-export interface Semester { id:number;name:string;code:string;state:string;version:number;start_date:string;end_date:string;registration_open:string;registration_close:string;completed:boolean;can_register:boolean;close_summary:any }
+export interface Semester { id:number;name:string;code:string;state:string;version:number;start_date:string;end_date:string;registration_open:string;registration_close:string;completed:boolean;completed_at:string|null;can_complete:boolean;can_register:boolean;can_reopen:boolean;close_summary:any }
 export interface Offering { id:number;code:string;course_id:number;course_code:string;name:string;department:string;credits:string;professor_id:number|null;professor_name:string|null;capacity:number;enrolled_count:number;remaining:number;fee:string;state:string;eligible:boolean;prerequisites_met:boolean;cancellation_reason:string|null;prerequisites:{code:string;name:string}[];meetings:{weekday:number;start_minute:number;end_minute:number;week_start:number;week_end:number;room:string}[] }
 export interface Schedule { version:number;exists:boolean;ever_submitted:boolean;primary:number[];alternates:number[];draft:{primary:number[];alternates:number[]}|null }
+export interface CourseStatusItem { offering_id:number;code:string;course_code:string;course:string;status:string;status_label:string;reason:string;effective:boolean;selection?:string;draft_choice?:string|null;fee?:string;billing_label?:string;enrolled_count?:number;capacity?:number }
+export interface RegistrationStatus { semester:Semester;schedule:Schedule;items:CourseStatusItem[];effective_ids:number[];invoice:any;summary:{registered:number;cancelled:number;withdrawn:number;billed:number;billing_consistent:boolean|null} }
 let csrf=''
 export function setCsrf(value:string){csrf=value}
 export class ApiError extends Error { constructor(public code:string,message:string,public status:number,public details:any,public requestId?:string){super(message);this.name='ApiError'} }
@@ -99,7 +101,7 @@ export async function api<T=any>(path:string,method='GET',data?:unknown,key?:str
 }
 export const time=(minutes:number)=>`${Math.floor(minutes/60).toString().padStart(2,'0')}:${(minutes%60).toString().padStart(2,'0')}`
 export const meetingText=(o:Offering)=>o.meetings.map(m=>`周${'一二三四五六日'[m.weekday-1]} ${time(m.start_minute)}–${time(m.end_minute)} · ${m.room}`).join('；')
-export const stateLabel=(state:string)=>({OPEN:'选课开放',CLOSED:'已结束',CANCELLED:'已取消',ENROLLED:'已注册',PENDING:'等待重试',PROCESSING:'发送中',SENT:'已送达'}[state]||state)
+export const stateLabel=(state:string)=>({OPEN:'选课开放',CLOSED:'选课已结束',CANCELLED:'已取消',ENROLLED:'已注册',PENDING:'等待重试',PROCESSING:'发送中',SENT:'已送达'}[state]||state)
 export async function allOfferings(semesterId:number){
   const items:Offering[]=[]
   for(let page=1;;page++){

@@ -1,13 +1,16 @@
 import hashlib
 import json
 import uuid
-from datetime import timedelta
+from datetime import timedelta, timezone
 from decimal import Decimal
 from sqlalchemy import select, delete
 from sqlalchemy.dialects.mysql import insert
 from .db import utcnow
 from .models import User, Semester, Course, Offering, Meeting, Prerequisite, Qualification, Schedule, Enrollment, Alternate, Invoice, Outbox, Idempotency, Audit
 from .errors import DomainError, require
+from .validation_messages import field_detail
+from .models import TeachingAssignment
+from . import academic
 
 def audit(db, actor, action, target, details=None):
     db.add(Audit(actor_id=actor, action=action, target=target, details=details or {}))
@@ -16,6 +19,14 @@ def emit(db, kind, payload):
     event = Outbox(id=str(uuid.uuid4()), kind=kind, payload=payload)
     db.add(event)
     return event
+
+
+def record_teaching(db,professor_id,offering_id,state,reason=None):
+    row=db.get(TeachingAssignment,(professor_id,offering_id))
+    if row is None:
+        row=TeachingAssignment(professor_id=professor_id,offering_id=offering_id)
+        db.add(row)
+    row.state,row.reason,row.updated_at=state,reason,utcnow()
 
 
 def registration_time_label(value):
@@ -117,7 +128,7 @@ def missing_prerequisites(db, student_id, course_id, term):
     required = set(db.scalars(select(Prerequisite.prerequisite_id).where(Prerequisite.course_id==course_id)))
     if not required:
         return set()
-    passed = set(db.scalars(select(Offering.course_id).join(Enrollment, Enrollment.offering_id==Offering.id).join(Semester, Semester.id==Offering.semester_id).where(Enrollment.student_id==student_id, Enrollment.state=='ENROLLED', Enrollment.grade.in_(['A','B','C','D']), Semester.end_date < term.start_date, Semester.end_date < utcnow().date())))
+    passed = set(db.scalars(select(Offering.course_id).join(Enrollment, Enrollment.offering_id==Offering.id).join(Semester, Semester.id==Offering.semester_id).where(Enrollment.student_id==student_id, Enrollment.state=='ENROLLED', Enrollment.grade.in_(['A','B','C','D']), academic.completion_date() < term.start_date, academic.completed_condition())))
     return required - passed
 
 
@@ -182,6 +193,7 @@ def submit_schedule(db, actor, semester_id, data):
     for e in old:
         if e.offering_id not in data.primary:
             e.state = 'DROPPED'
+            e.status_reason = '学生调整课表时退选'
             db.get(Offering,e.offering_id).enrolled_count -= 1
     for position, oid in enumerate(data.primary):
         enrollment = db.scalar(select(Enrollment).where(Enrollment.student_id==actor,Enrollment.offering_id==oid))
@@ -192,6 +204,7 @@ def submit_schedule(db, actor, semester_id, data):
             if enrollment.state!='ENROLLED':
                 offers[oid].enrolled_count += 1
             enrollment.state, enrollment.position = 'ENROLLED',position
+            enrollment.status_reason = None
     db.execute(delete(Alternate).where(Alternate.schedule_id==row.id))
     for position,oid in enumerate(data.alternates):
         db.add(Alternate(schedule_id=row.id,offering_id=oid,position=position))
@@ -213,6 +226,7 @@ def delete_schedule(db,actor,semester_id,version):
     list(db.scalars(select(Offering).where(Offering.id.in_([e.offering_id for e in old])).order_by(Offering.id).with_for_update()))
     for e in old:
         e.state = 'DROPPED'
+        e.status_reason = '学生删除了本学期课表'
         db.get(Offering,e.offering_id).enrolled_count -= 1
     db.execute(delete(Alternate).where(Alternate.schedule_id==row.id))
     row.deleted,row.draft = True,None
@@ -247,9 +261,11 @@ def update_teaching(db,actor,semester_id,data):
     for o in offers:
         if o.id in selected:
             o.professor_id = actor
+            record_teaching(db,actor,o.id,'ASSIGNED')
         elif o.professor_id==actor:
             o.professor_id = None
-    audit(db,actor,'UPDATE_TEACHING',f'semester:{semester_id}',{'offering_ids':data.offering_ids})
+            record_teaching(db,actor,o.id,'WITHDRAWN','教授主动取消任课')
+    audit(db,actor,'UPDATE_TEACHING',f'semester:{semester_id}',{'offering_ids':data.offering_ids,'previous_ids':sorted(old_ids)})
     return {'offering_ids':data.offering_ids}
 
 def close_registration(db,actor,semester_id,version):
@@ -264,6 +280,7 @@ def close_registration(db,actor,semester_id,version):
         o.state,o.cancellation_reason,o.enrolled_count = 'CANCELLED',reason,0
         for enrollment in db.scalars(select(Enrollment).where(Enrollment.offering_id==o.id,Enrollment.state=='ENROLLED')):
             enrollment.state = 'CANCELLED'
+            enrollment.status_reason = reason
         cancelled.append({'id':o.id,'code':o.code,'reason':reason})
         db.flush()
 
@@ -286,6 +303,7 @@ def close_registration(db,actor,semester_id,version):
             enrollment = db.scalar(select(Enrollment).where(Enrollment.student_id==row.student_id,Enrollment.offering_id==o.id))
             if enrollment:
                 enrollment.state,enrollment.position = 'ENROLLED',len(ids)
+                enrollment.status_reason = None
             else:
                 db.add(Enrollment(student_id=row.student_id,offering_id=o.id,state='ENROLLED',position=len(ids)))
             o.enrolled_count += 1
@@ -306,8 +324,13 @@ def close_registration(db,actor,semester_id,version):
             c=db.get(Course,o.course_id)
             lines.append({'offering_id':o.id,'code':o.code,'course':c.name,'fee':str(o.fee)})
         total=sum((Decimal(line['fee']) for line in lines),Decimal('0.00'))
-        db.add(Invoice(student_id=row.student_id,semester_id=semester_id,total=total,lines=lines))
-        emit(db,'InvoiceFinalized',{'student_id':row.student_id,'semester_id':semester_id,'total':str(total),'lines':lines})
+        invoice=db.scalar(select(Invoice).where(Invoice.student_id==row.student_id,Invoice.semester_id==semester_id).with_for_update())
+        if invoice is None:
+            invoice=Invoice(student_id=row.student_id,semester_id=semester_id)
+            db.add(invoice)
+        invoice.total,invoice.lines=total,lines
+        invoice.status,invoice.revision,invoice.created_at='ACTIVE',term.version+1,utcnow()
+        emit(db,'InvoiceFinalized',{'student_id':row.student_id,'semester_id':semester_id,'total':str(total),'lines':lines,'revision':invoice.revision})
         row.version += 1
         row.draft = None
     term.state,term.closed_at = 'CLOSED',utcnow()
@@ -317,3 +340,75 @@ def close_registration(db,actor,semester_id,version):
     audit(db,actor,'CLOSE_REGISTRATION',f'semester:{term.id}',summary)
     db.flush()
     return summary
+
+
+def complete_semester(db,actor,semester_id,version):
+    term=db.scalar(select(Semester).where(Semester.id==semester_id).with_for_update(nowait=True).execution_options(populate_existing=True))
+    require(term,'SEMESTER_NOT_FOUND','未找到所选学期，请刷新学期列表后重新选择',404)
+    check_version(term.version,version)
+    require(term.state=='CLOSED','REGISTRATION_STILL_OPEN','不能直接结课：该学期尚未结束选课，请先点击“结束选课”，确认最终教学班和学生名单')
+    require(not academic.is_completed(term),'SEMESTER_COMPLETED','该学期已经结课，无需重复操作；教授可在本人的“名单与成绩”中录入成绩')
+    term.completed_at=utcnow()
+    term.version+=1
+    audit(db,actor,'COMPLETE_SEMESTER',f'semester:{term.id}',{'completed_at':term.completed_at.isoformat(),'planned_end_date':term.end_date.isoformat()})
+    db.flush()
+    return {'semester_id':term.id,'completed':True,'completed_at':term.completed_at.isoformat(),'version':term.version}
+
+
+def reopen_registration(db,actor,semester_id,data):
+    # Same NOWAIT exclusive lock as closing: never reopen over a live mutation.
+    term=db.scalar(select(Semester).where(Semester.id==semester_id).with_for_update(nowait=True).execution_options(populate_existing=True))
+    require(term,'SEMESTER_NOT_FOUND','未找到所选学期，请刷新学期列表后重新选择',404)
+    check_version(term.version,data.version)
+    require(term.state=='CLOSED','REGISTRATION_ALREADY_OPEN','该学期选课已开放，无需重复开启；如需延长选课时间，请使用“调整开放时间”')
+    now=utcnow()
+    require(not academic.is_completed(term),'SEMESTER_COMPLETED',f'“{term.name}”已结课，不能重新开启选课；请保留最终名单并在教授端录入或修改成绩')
+    opening=data.registration_open.astimezone(timezone.utc).replace(tzinfo=None)
+    closing=data.registration_close.astimezone(timezone.utc).replace(tzinfo=None)
+    require(closing>now,'INVALID_WINDOW','重新开启失败：选课截止时间必须晚于当前时间，请重新选择截止时间',422,
+            [field_detail('body.registration_close','选课截止时间已过去，请选择未来时间')])
+    require(closing.date()<=term.end_date,'INVALID_WINDOW',f'选课截止时间不能晚于学期结束日期（{term.end_date:%Y-%m-%d}，按UTC日期核对）',422,
+            [field_detail('body.registration_close',f'截止时间转换为UTC后的日期不能晚于{term.end_date:%Y-%m-%d}')])
+    graded=db.scalar(select(Enrollment.id).join(Offering).where(Offering.semester_id==semester_id,Enrollment.grade.is_not(None)).limit(1))
+    require(graded is None,'GRADES_ALREADY_RECORDED','该学期已有录入的成绩，不能重新开启选课；请保留现有课表与成绩并联系教务核对')
+    offers=list(db.scalars(select(Offering).where(Offering.semester_id==semester_id).order_by(Offering.id).with_for_update()))
+    active_professors=set(db.scalars(select(User.id).where(User.role=='professor',User.active.is_(True))))
+    # Deactivation while CLOSED intentionally kept history. Those relations
+    # must no longer occupy seats once the semester accepts registration again.
+    inactive_students=set(db.scalars(select(User.id).where(User.role=='student',User.active.is_(False))))
+    for enrollment in db.scalars(select(Enrollment).join(Offering).where(Offering.semester_id==semester_id,Enrollment.student_id.in_(inactive_students),Enrollment.state=='ENROLLED')):
+        enrollment.state='DROPPED'
+        enrollment.status_reason='账户已停用，重新开启选课时释放名额'
+        db.get(Offering,enrollment.offering_id).enrolled_count-=1
+    for offer in offers:
+        offer.state,offer.cancellation_reason='OPEN',None
+        if offer.professor_id not in active_professors:
+            if offer.professor_id is not None:
+                record_teaching(db,offer.professor_id,offer.id,'WITHDRAWN','账户已停用，重新开启选课时撤销任课')
+            offer.professor_id=None
+    schedules=list(db.scalars(select(Schedule).where(Schedule.semester_id==semester_id).order_by(Schedule.id).with_for_update()))
+    for row in schedules:
+        # Keep confirmed seats and the original submission order. Cancelled seats
+        # are not restored: alternates may already have filled those places.
+        courses={db.get(Offering,e.offering_id).course_id for e in current_enrollments(db,row.student_id,semester_id)}
+        for alt in list(db.scalars(select(Alternate).where(Alternate.schedule_id==row.id))):
+            if row.student_id in inactive_students or db.get(Offering,alt.offering_id).course_id in courses:
+                db.delete(alt)
+        if row.student_id in inactive_students:
+            row.deleted=True
+        row.version+=1
+        row.draft=None
+    invoices=list(db.scalars(select(Invoice).where(Invoice.semester_id==semester_id,Invoice.status=='ACTIVE').order_by(Invoice.id).with_for_update()))
+    for invoice in invoices:
+        invoice.status,invoice.revision='VOIDED',term.version+1
+        emit(db,'InvoiceVoided',{'student_id':invoice.student_id,'semester_id':semester_id,'total':'0.00','lines':[],'revision':invoice.revision})
+    previous_summary=term.close_summary
+    term.state,term.closed_at,term.close_summary='OPEN',None,None
+    term.registration_open,term.registration_close=opening,closing
+    term.version+=1
+    result={'semester_id':semester_id,'version':term.version,'reopened_offerings':len(offers),'voided_invoices':len(invoices)}
+    audit(db,actor,'REOPEN_REGISTRATION',f'semester:{semester_id}',{
+        **result,'previous_close_summary':previous_summary,
+        'registration_open':data.registration_open.isoformat(),'registration_close':data.registration_close.isoformat()})
+    db.flush()
+    return result

@@ -34,5 +34,6 @@ if not url.database or not url.database.replace('_','').isalnum():
 with engine.begin() as connection:
     accounts=connection.execute(text('SELECT User,Host FROM mysql.user WHERE User=:name'),{'name':url.username}).all()
     for account,host in accounts:
-        connection.execute(text(f'GRANT SELECT,INSERT,UPDATE,DELETE ON `{url.database}`.`file_catalog` TO :name@:host'),{'name':account,'host':host})
+        for table in ('file_catalog','teaching_assignments'):
+            connection.execute(text(f'GRANT SELECT,INSERT,UPDATE,DELETE ON `{url.database}`.`{table}` TO :name@:host'),{'name':account,'host':host})
 print('项目数据库迁移完成。')

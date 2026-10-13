@@ -41,12 +41,18 @@ class Event(BaseModel):
     payload:dict
 
 def accept_event(event):
-    if event.kind not in {'RegistrationUpdated','InvoiceFinalized'}:
+    if event.kind not in {'RegistrationUpdated','InvoiceFinalized','InvoiceVoided'}:
         raise HTTPException(422,'Unknown event kind')
     payload=event.payload
     if any(type(payload.get(field)) is not int or not 0 < payload[field] <= 2147483647
            for field in ('student_id','semester_id')):
         raise HTTPException(422,'Invalid identity')
+    revision=payload.get('revision',0)
+    if event.kind in {'InvoiceFinalized','InvoiceVoided'}:
+        if type(revision) is not int or not 0 <= revision <= 2147483647:
+            raise HTTPException(422,'Invalid invoice revision')
+        if event.kind=='InvoiceVoided' and (revision==0 or payload.get('total')!='0.00' or payload.get('lines')!=[]):
+            raise HTTPException(422,'Invalid invoice void')
     fingerprint=hashlib.sha256(json.dumps(event.model_dump(),sort_keys=True,ensure_ascii=False).encode()).hexdigest()
     with SessionLocal() as db:
         stmt=insert(BillingReceipt).values(event_id=event.event_id,digest=fingerprint,kind=event.kind)
@@ -54,12 +60,17 @@ def accept_event(event):
         receipt=db.get(BillingReceipt,event.event_id,with_for_update=True)
         if receipt.digest!=fingerprint:
             raise HTTPException(409,'Event content mismatch')
-        if event.kind=='InvoiceFinalized':
-            stmt=insert(BillingInvoice).values(student_id=payload['student_id'],semester_id=payload['semester_id'],payload=payload)
+        if event.kind in {'InvoiceFinalized','InvoiceVoided'}:
+            status='VOIDED' if event.kind=='InvoiceVoided' else 'ACTIVE'
+            stmt=insert(BillingInvoice).values(student_id=payload['student_id'],semester_id=payload['semester_id'],payload=payload,status=status,revision=revision)
             db.execute(stmt.on_duplicate_key_update(student_id=stmt.inserted.student_id))
             invoice=db.get(BillingInvoice,(payload['student_id'],payload['semester_id']),with_for_update=True)
-            if invoice.payload!=payload:
+            if invoice.revision==revision and (invoice.payload!=payload or invoice.status!=status):
                 raise HTTPException(409,'Final invoice mismatch')
+            if revision>invoice.revision:
+                invoice.payload,invoice.status,invoice.revision=payload,status,revision
+            # Older events are acknowledged but cannot overwrite a newer bill
+            # or revive a voided one, even after retry/restart or out-of-order delivery.
         db.commit()
     return {'accepted':True,'event_id':event.event_id}
 

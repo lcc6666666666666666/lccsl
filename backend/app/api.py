@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select, func, delete, text
 from sqlalchemy.orm import Session
 from .db import get_db, utcnow
-from .models import User, LoginSession, Semester, Course, Offering, Meeting, Prerequisite, Qualification, Schedule, Enrollment, Alternate, Invoice, Outbox, Audit, FileCatalog
+from .models import User, LoginSession, LoginThrottle, Semester, Course, Offering, Meeting, Prerequisite, Qualification, Schedule, Enrollment, Alternate, Invoice, Outbox, Audit, FileCatalog
 from .schemas import Login, PasswordChange, ScheduleInput, VersionInput, TeachingInput, GradesInput, PersonCreate, PersonInput, SemesterInput, validate_identity_number
 from .security import principal, role, authenticate, public_user, digest, password_hasher, encrypt_identity, identity_fingerprint, masked_identity, decrypt_identity
 from .errors import require, DomainError
@@ -14,6 +14,8 @@ from .catalog import ensure_catalog,offering_structure,validate_catalog_document
 from .validation_messages import field_detail
 from . import services as svc
 from . import catalog_import as catalog_files
+from . import course_status
+from . import academic
 
 router = APIRouter(prefix='/api/v1')
 DB = Annotated[Session, Depends(get_db)]
@@ -63,7 +65,10 @@ def term_view(t):
             'registration_open':t.registration_open.replace(tzinfo=timezone.utc),
             'registration_close':t.registration_close.replace(tzinfo=timezone.utc),
             'state':t.state,'version':t.version,'close_summary':t.close_summary,
-            'completed':t.end_date<utcnow().date(),
+            'completed':academic.is_completed(t),
+            'completed_at':t.completed_at.replace(tzinfo=timezone.utc) if t.completed_at else None,
+            'can_complete':t.state=='CLOSED' and not academic.is_completed(t),
+            'can_reopen':t.state=='CLOSED' and not academic.is_completed(t),
             'can_register':t.state=='OPEN' and t.registration_open<=utcnow()<=t.registration_close}
 
 @router.get('/semesters')
@@ -91,7 +96,7 @@ def offerings(p:P,db:DB,semester_id:int,q:str=Query(default='',max_length=100),p
     rows=db.execute(query.order_by(Offering.id).offset((page-1)*page_size).limit(page_size)).all()
     total=rows[0][2] if rows else db.scalar(select(func.count()).select_from(query.subquery()))
     qualified=set(db.scalars(select(Qualification.course_id).where(Qualification.professor_id==p.id))) if p.role=='professor' else set()
-    passed=set(db.scalars(select(Offering.course_id).join(Enrollment).join(Semester).where(Enrollment.student_id==p.id,Enrollment.state=='ENROLLED',Enrollment.grade.in_(['A','B','C','D']),Semester.end_date<structure['start_date'],Semester.end_date<utcnow().date()))) if p.role=='student' else set()
+    passed=set(db.scalars(select(Offering.course_id).join(Enrollment).join(Semester).where(Enrollment.student_id==p.id,Enrollment.state=='ENROLLED',Enrollment.grade.in_(['A','B','C','D']),academic.completion_date()<structure['start_date'],academic.completed_condition()))) if p.role=='student' else set()
     result=[]
     for o,name,_total in rows:
         c=structure['courses'][o.course_id]
@@ -110,6 +115,12 @@ def offerings(p:P,db:DB,semester_id:int,q:str=Query(default='',max_length=100),p
 def get_schedule(semester_id:int,p:P,db:DB):
     role(p,'student')
     return JSONResponse(svc.schedule_view(db,p.id,semester_id))
+
+@router.get('/student/registration-status/{semester_id}')
+def registration_status(semester_id:int,p:P,db:DB):
+    role(p,'student')
+    term=course_status.lock_snapshot(db,p.id,semester_id)
+    return {'semester':term_view(term),**course_status.registration_status(db,p.id,term)}
 
 @router.put('/student/schedules/{semester_id}/draft')
 def draft(semester_id:int,data:ScheduleInput,p:P,db:DB):
@@ -132,20 +143,26 @@ def remove_schedule(semester_id:int,data:VersionInput,p:P,db:DB):
 @router.get('/student/report-card')
 def report(p:P,db:DB,semester_id:int|None=None):
     role(p,'student')
-    term=db.get(Semester,semester_id) if semester_id else db.scalar(select(Semester).where(Semester.end_date<utcnow().date()).order_by(Semester.end_date.desc()))
-    require(term and term.end_date<utcnow().date(),'NO_REPORT_CARD','所选学期不存在或尚未结束，暂不能查看成绩单。请选择已结束的学期；没有已结束学期时请等待学期结束',404)
+    term=db.get(Semester,semester_id) if semester_id else db.scalar(select(Semester).where(academic.completed_condition()).order_by(academic.completion_date().desc(),Semester.id.desc()))
+    require(term and academic.is_completed(term),'NO_REPORT_CARD','所选学期不存在或尚未结课，暂不能查看成绩单。请选择已结课学期；管理员结束学期后即可查看该学期成绩',404)
     rows=db.execute(select(Enrollment,Offering,Course).join(Offering,Offering.id==Enrollment.offering_id).join(Course,Course.id==Offering.course_id).where(Enrollment.student_id==p.id,Enrollment.state=='ENROLLED',Offering.semester_id==term.id)).all()
     return {'semester':term_view(term),'items':[{'offering_id':o.id,'course':c.name,'code':c.code,'credits':str(c.credits),'grade':e.grade} for e,o,c in rows]}
 
 @router.get('/student/invoices')
 def invoices(p:P,db:DB):
     role(p,'student')
-    return [{'id':i.id,'semester_id':i.semester_id,'total':str(i.total),'lines':i.lines,'created_at':i.created_at} for i in db.scalars(select(Invoice).where(Invoice.student_id==p.id).order_by(Invoice.created_at.desc()))]
+    return [{'id':i.id,'semester_id':i.semester_id,'total':str(i.total),'lines':i.lines,'created_at':i.created_at,'status':i.status,'revision':i.revision} for i in db.scalars(select(Invoice).where(Invoice.student_id==p.id).order_by(Invoice.created_at.desc()))]
 
 @router.get('/professor/teaching/{semester_id}')
 def teaching(semester_id:int,p:P,db:DB):
     role(p,'professor')
     return {'offering_ids':list(db.scalars(select(Offering.id).where(Offering.semester_id==semester_id,Offering.professor_id==p.id).order_by(Offering.id)))}
+
+@router.get('/professor/teaching-status/{semester_id}')
+def teaching_status(semester_id:int,p:P,db:DB):
+    role(p,'professor')
+    term=course_status.lock_snapshot(db,p.id,semester_id)
+    return {'semester':term_view(term),**course_status.teaching_status(db,p.id,term)}
 
 @router.put('/professor/teaching/{semester_id}')
 def set_teaching(semester_id:int,data:TeachingInput,p:P,db:DB):
@@ -156,20 +173,25 @@ def set_teaching(semester_id:int,data:TeachingInput,p:P,db:DB):
 @router.get('/professor/offerings/{offering_id}/roster')
 def roster(offering_id:int,p:P,db:DB):
     role(p,'professor')
-    o=db.get(Offering,offering_id)
+    semester_id=db.scalar(select(Offering.semester_id).where(Offering.id==offering_id,Offering.professor_id==p.id))
+    require(semester_id,'OFFERING_NOT_FOUND','教学班不存在或不属于本人，请刷新本人授课列表并重新选择教学班',404)
+    term=course_status.lock_snapshot(db,p.id,semester_id)
+    o=db.scalar(select(Offering).where(Offering.id==offering_id).execution_options(populate_existing=True))
     require(o and o.professor_id==p.id,'OFFERING_NOT_FOUND','教学班不存在或不属于本人，请刷新本人授课列表并重新选择教学班',404)
-    term=db.get(Semester,o.semester_id)
     rows=db.execute(select(Enrollment,User).join(User,User.id==Enrollment.student_id).where(Enrollment.offering_id==o.id,Enrollment.state=='ENROLLED').order_by(User.id)).all()
-    return {'can_grade':term.end_date<utcnow().date() and o.state=='CLOSED','items':[{'student_id':u.id,'name':u.name,'username':u.username,'grade':e.grade,'version':e.grade_version} for e,u in rows]}
+    return {**academic.grading_status(term,o),'semester':term_view(term),'items':[{'student_id':u.id,'name':u.name,'username':u.username,'grade':e.grade,'version':e.grade_version} for e,u in rows]}
 
 @router.put('/professor/offerings/{offering_id}/grades')
 def grades(offering_id:int,data:GradesInput,p:P,db:DB):
     role(p,'professor')
+    semester_id=db.scalar(select(Offering.semester_id).where(Offering.id==offering_id,Offering.professor_id==p.id))
+    require(semester_id,'OFFERING_NOT_FOUND','教学班不存在或不属于本人，请刷新本人授课列表并重新选择教学班',404)
+    term=db.scalar(select(Semester).where(Semester.id==semester_id).with_for_update(read=True,nowait=True))
     svc.lock_user(db,p.id)
     o=db.scalar(select(Offering).where(Offering.id==offering_id).with_for_update())
     require(o and o.professor_id==p.id,'OFFERING_NOT_FOUND','教学班不存在或不属于本人，请刷新本人授课列表并重新选择教学班',404)
-    term=db.get(Semester,o.semester_id)
-    require(term.end_date<utcnow().date() and o.state=='CLOSED','GRADING_NOT_OPEN','该教学班尚未满足成绩录入条件：必须已结束选课且学期已经结束。请选择本人已结束学期的教学班')
+    grading=academic.grading_status(term,o)
+    require(grading['can_grade'],'GRADING_NOT_OPEN',grading['grading_message'])
     require(len({v.student_id for v in data.grades})==len(data.grades),'DUPLICATE_STUDENT','成绩列表中同一学生出现多次，每名学生只能提交一条成绩。请刷新名单后重新填写',422,
             [field_detail('body.grades','成绩列表中存在重复学生，请删除重复记录后提交')])
     for value in sorted(data.grades,key=lambda v:v.student_id):
@@ -292,9 +314,14 @@ def create_person(kind:str,data:PersonCreate,p:P,db:DB):
     result={'person':person_view(db,u),'initial_password':password}
     return commit(db,result)
 
-def lock_person_mutation(db,user_id):
-    # Consistent term -> user -> offering order also serializes with closing a term.
-    list(db.scalars(select(Semester).where(Semester.state=='OPEN').order_by(Semester.id).with_for_update(read=True)))
+def lock_person_mutation(db,user_id,*,allow_inactive=False):
+    # Include CLOSED terms: a concurrent reopen must not restore the relations
+    # of a user while this transaction is deactivating or changing that user.
+    list(db.scalars(select(Semester).order_by(Semester.id).with_for_update(read=True)))
+    if allow_inactive:
+        u=db.scalar(select(User).where(User.id==user_id).with_for_update().execution_options(populate_existing=True))
+        require(u,'PERSON_NOT_FOUND','未找到该人员记录，请刷新学生或教授列表后重新选择',404)
+        return u
     return svc.lock_user(db,user_id)
 
 @router.put('/registrar/people/{user_id}')
@@ -321,6 +348,7 @@ def deactivate(user_id:int,data:VersionInput,p:P,db:DB):
         list(db.scalars(select(Offering).where(Offering.id.in_([e.offering_id for e in rows])).order_by(Offering.id).with_for_update()))
         for e in rows:
             e.state='DROPPED'
+            e.status_reason='学生账户已停用，已释放名额'
             db.get(Offering,e.offering_id).enrolled_count-=1
         for s in db.scalars(select(Schedule).where(Schedule.student_id==u.id,Schedule.semester_id.in_(terms)).with_for_update()):
             s.deleted,s.draft=True,None
@@ -329,12 +357,32 @@ def deactivate(user_id:int,data:VersionInput,p:P,db:DB):
             svc.emit(db,'RegistrationUpdated',{'student_id':u.id,'semester_id':s.semester_id,'version':s.version,'offering_ids':[]})
     else:
         for o in db.scalars(select(Offering).where(Offering.professor_id==u.id,Offering.semester_id.in_(terms)).order_by(Offering.id).with_for_update()):
+            svc.record_teaching(db,u.id,o.id,'WITHDRAWN','教授账户已停用，已撤销任课')
             o.professor_id=None
     u.active=False
     u.version+=1
     db.execute(delete(LoginSession).where(LoginSession.user_id==u.id))
     svc.audit(db,p.id,'DEACTIVATE_PERSON',f'user:{u.id}')
     return commit(db,{'ok':True})
+
+@router.post('/registrar/people/{user_id}/reactivate')
+def reactivate(user_id:int,data:VersionInput,p:P,db:DB):
+    role(p,'registrar')
+    u=lock_person_mutation(db,user_id,allow_inactive=True)
+    require(u.role in {'student','professor'},'PERSON_NOT_FOUND','该记录不是可管理的学生或教授，请刷新人员列表后重新选择',404)
+    svc.check_version(u.version,data.version)
+    require(not u.active,'ACCOUNT_ALREADY_ACTIVE','该账号已处于启用状态，无需再次恢复；请刷新人员列表查看最新状态',409)
+    u.active=True
+    u.version+=1
+    # Re-enable login only. Released seats and teaching assignments must be
+    # selected again through their usual capacity/qualification checks.
+    db.execute(delete(LoginSession).where(LoginSession.user_id==u.id))
+    # Disabled login attempts must not keep this account locked after recovery.
+    # Keep the independent address-wide throttle in place.
+    db.execute(delete(LoginThrottle).where(LoginThrottle.key==digest('account:'+u.username)))
+    svc.audit(db,p.id,'REACTIVATE_PERSON',f'user:{u.id}',{'role':u.role})
+    db.flush()
+    return commit(db,person_view(db,u))
 
 @router.post('/registrar/people/{user_id}/reset-password')
 def reset_password(user_id:int,p:P,db:DB):
@@ -367,6 +415,16 @@ def update_term(semester_id:int,data:SemesterInput,p:P,db:DB):
 def close(semester_id:int,data:VersionInput,p:P,db:DB,idempotency_key:Annotated[str|None,Header()]=None):
     role(p,'registrar')
     return commit(db,svc.idempotent(db,p.id,f'close:{semester_id}',idempotency_key,data.model_dump(),lambda:svc.close_registration(db,p.id,semester_id,data.version),semester_id=semester_id,closing=True))
+
+@router.post('/registrar/semesters/{semester_id}/reopen')
+def reopen(semester_id:int,data:SemesterInput,p:P,db:DB,idempotency_key:Annotated[str|None,Header()]=None):
+    role(p,'registrar')
+    return commit(db,svc.idempotent(db,p.id,f'reopen:{semester_id}',idempotency_key,data.model_dump(),lambda:svc.reopen_registration(db,p.id,semester_id,data),semester_id=semester_id,closing=True))
+
+@router.post('/registrar/semesters/{semester_id}/complete')
+def complete(semester_id:int,data:VersionInput,p:P,db:DB,idempotency_key:Annotated[str|None,Header()]=None):
+    role(p,'registrar')
+    return commit(db,svc.idempotent(db,p.id,f'complete:{semester_id}',idempotency_key,data.model_dump(),lambda:svc.complete_semester(db,p.id,semester_id,data.version),semester_id=semester_id,closing=True))
 
 @router.get('/registrar/outbox')
 def outbox(p:P,db:DB,page:int=Query(default=1,ge=1),page_size:int=Query(default=20,ge=1,le=100)):
