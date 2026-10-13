@@ -2,6 +2,18 @@
 
 按《2026 年软件工程课程设计题目》及确认的实现方案开发。学生选课、教授任课与成绩、教务人员维护、结束选课和可靠计费均有可运行实现。
 
+## Docker 一键部署（新电脑推荐）
+
+先安装并启动 Docker Desktop，使用 Linux 容器，然后双击 **Docker一键部署.cmd**。脚本自动下载镜像、安装锁定的依赖、构建 Vue 页面、初始化独立 MySQL 8.0、生成随机演示账号并启动所有服务，无需在宿主机安装 Python、Node.js 或 MySQL。
+
+- 访问 **http://127.0.0.1:8080**。
+- 初始账号位于 **`.runtime/docker/accounts/演示账号.txt`**，首次登录须修改密码。
+- 再次运行保留数据库、业务数据和密码；双击 **Docker停止.cmd** 停止容器并保留数据卷。
+- Linux/macOS：`bash scripts/docker_deploy.sh`；停止：`bash scripts/docker_deploy.sh --stop`。
+- Docker 数据独立于原本的本机运行环境。课程目录文件导入暂未启用；目录模拟服务随容器一起启动。
+
+参数、故障处理、数据保存位置及验证范围见 [Docker 部署说明](docs/Docker部署说明.md)。
+
 ## 在当前电脑使用
 
 1. 双击 **启动系统.cmd**，或在 PowerShell 中运行 `powershell -ExecutionPolicy Bypass -File .\scripts\start.ps1`。

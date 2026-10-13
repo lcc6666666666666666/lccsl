@@ -1,0 +1,23 @@
+# Allow-list the build inputs: never send local credentials or database files.
+**
+!Dockerfile
+!.dockerignore
+!requirements.docker.lock
+!backend/
+!backend/**
+!scripts/
+!scripts/docker_entrypoint.py
+!scripts/docker_init.py
+!scripts/docker_healthcheck.py
+!frontend/
+!frontend/**
+**/__pycache__
+**/*.pyc
+**/.env
+**/.env.*
+frontend/node_modules
+frontend/dist
+frontend/coverage
+frontend/.vite
+frontend/test-results
+frontend/playwright-report
