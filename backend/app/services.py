@@ -1,6 +1,7 @@
 import hashlib
 import json
 import uuid
+from datetime import timedelta
 from decimal import Decimal
 from sqlalchemy import select, delete
 from sqlalchemy.dialects.mysql import insert
@@ -16,18 +17,30 @@ def emit(db, kind, payload):
     db.add(event)
     return event
 
+
+def registration_time_label(value):
+    try:
+        return f'{value + timedelta(hours=8):%Y-%m-%d %H:%M}（北京时间）'
+    except OverflowError:
+        # Keep diagnostics safe even for an extreme, valid database datetime.
+        return f'{value:%Y-%m-%d %H:%M}（UTC）'
+
+
 def lock_semester(db, semester_id, close=False):
     term = db.scalar(select(Semester).where(Semester.id==semester_id).with_for_update(read=not close, nowait=close).execution_options(populate_existing=True))
-    require(term, 'SEMESTER_NOT_FOUND', '学期不存在', 404)
-    require(term.state=='OPEN', 'REGISTRATION_CLOSED', '该学期选课已结束')
+    require(term, 'SEMESTER_NOT_FOUND', '未找到所选学期，请刷新学期列表后重新选择', 404)
+    require(term.state=='OPEN', 'REGISTRATION_CLOSED', f'“{term.name}”选课已结束，正式课表和任课安排已冻结；请切换到开放选课的学期')
     if not close:
-        require(term.registration_open <= utcnow() <= term.registration_close, 'REGISTRATION_NOT_OPEN', '当前不在选课开放时间内')
+        if not term.registration_open <= utcnow() <= term.registration_close:
+            opened = registration_time_label(term.registration_open)
+            closed = registration_time_label(term.registration_close)
+            raise DomainError('REGISTRATION_NOT_OPEN', f'“{term.name}”当前不在选课开放时间内；开放时间为 {opened} 至 {closed}，请在该时间内操作或联系教务管理员核对')
     return term
 
 def lock_user(db, user_id):
     u = db.scalar(select(User).where(User.id==user_id).with_for_update().execution_options(populate_existing=True))
-    require(u,'PERSON_NOT_FOUND','人员不存在',404)
-    require(u.active, 'ACCOUNT_DISABLED', '账户已停用', 403)
+    require(u,'PERSON_NOT_FOUND','未找到当前账户，请重新登录；仍无法使用时请联系教务管理员',404)
+    require(u.active, 'ACCOUNT_DISABLED', '当前账户已停用，无法修改选课或任课安排；请联系教务管理员核对账户状态', 403)
     return u
 
 def lock_schedule(db, student_id, semester_id):
@@ -36,21 +49,21 @@ def lock_schedule(db, student_id, semester_id):
     return db.scalar(select(Schedule).where(Schedule.student_id==student_id, Schedule.semester_id==semester_id).with_for_update().execution_options(populate_existing=True))
 
 def check_version(actual, expected):
-    require(actual==expected, 'VERSION_CONFLICT', '数据已被其他操作修改，请刷新后重试', details={'current_version':actual})
+    require(actual==expected, 'VERSION_CONFLICT', '本次修改未保存：当前页面的数据已被其他操作更新。请先记录尚未保存的内容，再刷新页面，以最新数据重新修改并提交', details={'current_version':actual})
 
 def idempotent(db, user_id, operation, key, payload, action, *, semester_id, closing=False):
-    require(key and 8 <= len(key) <= 80, 'IDEMPOTENCY_REQUIRED', '缺少有效的请求编号', 422)
+    require(key and 8 <= len(key) <= 80, 'IDEMPOTENCY_REQUIRED', '本次提交缺少有效的防重复请求标识（需为8～80个字符）；请刷新页面后重新提交，仍失败时请联系管理员', 422)
     # Lock parent rows BEFORE inserting a child with a user FK. Otherwise two
     # insertions can retain shared FK locks while both try to upgrade the user lock.
     # Do not check OPEN here: an already committed response can be replayed after closing.
     term=db.scalar(select(Semester).where(Semester.id==semester_id).with_for_update(read=not closing,nowait=closing))
-    require(term,'SEMESTER_NOT_FOUND','学期不存在',404)
+    require(term,'SEMESTER_NOT_FOUND','未找到所选学期，请刷新学期列表后重新选择',404)
     lock_user(db,user_id)
     fingerprint = hashlib.sha256(json.dumps(payload,sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
     stmt = insert(Idempotency).values(user_id=user_id, operation=operation, key=key, request_hash=fingerprint)
     db.execute(stmt.on_duplicate_key_update(key=stmt.inserted.key))
     record = db.get(Idempotency, (user_id,operation,key), with_for_update=True)
-    require(record.request_hash==fingerprint, 'IDEMPOTENCY_CONFLICT', '同一请求编号不能用于不同的操作内容')
+    require(record.request_hash==fingerprint, 'IDEMPOTENCY_CONFLICT', '本次提交内容与此前使用同一请求标识提交的内容不一致，无法确认是否为重复操作；请先刷新查看最新结果，再重新提交修改')
     if record.response is not None:
         return record.response
     result = action()
@@ -58,16 +71,36 @@ def idempotent(db, user_id, operation, key, payload, action, *, semester_id, clo
     db.flush()
     return result
 
+def course_label(db, course_id):
+    course = db.get(Course, course_id)
+    return f'《{course.name}》（{course.code}）' if course else '所选课程'
+
+
+def offering_label(db, offering):
+    return f'{course_label(db, offering.course_id)}教学班 {offering.code}'
+
+
 def validate_selection(db, semester_id, primary, alternates, lock=True):
     ids = primary+alternates
-    require(len(ids)==len(set(ids)), 'DUPLICATE_OFFERING', '首选和备选教学班不能重复', 422)
+    if len(ids)!=len(set(ids)):
+        duplicates = '、'.join(str(oid) for oid in sorted({oid for oid in ids if ids.count(oid)>1}))
+        raise DomainError('DUPLICATE_OFFERING', f'首选和备选中重复选择了教学班（编号：{duplicates}）；每个教学班只能保留一次，请删除重复项后重试', 422)
     query=select(Offering).where(Offering.id.in_(ids),Offering.semester_id==semester_id).order_by(Offering.id)
     if lock:
         query=query.with_for_update()
     offerings = list(db.scalars(query)) if ids else []
-    require(len(offerings)==len(ids), 'INVALID_OFFERING', '教学班不存在或不属于该学期', 422)
-    require(len({o.course_id for o in offerings})==len(ids), 'DUPLICATE_COURSE', '同一门课程不能选择多个教学班', 422)
-    require(all(o.state=='OPEN' for o in offerings), 'OFFERING_CLOSED', '所选教学班已关闭')
+    if len(offerings)!=len(ids):
+        missing = '、'.join(str(oid) for oid in sorted(set(ids)-{o.id for o in offerings}))
+        raise DomainError('INVALID_OFFERING', f'教学班（编号：{missing}）不存在或不属于当前所选学期；请刷新课程目录并重新选择', 422)
+    by_course = {}
+    for offering in offerings:
+        by_course.setdefault(offering.course_id, []).append(offering)
+    duplicate_courses = [group for group in by_course.values() if len(group)>1]
+    if duplicate_courses:
+        names = '；'.join(f'{course_label(db, group[0].course_id)}：{"、".join(o.code for o in group)}' for group in duplicate_courses)
+        raise DomainError('DUPLICATE_COURSE', f'同一门课程在首选和备选中只能保留一个教学班；重复课程为 {names}，请删除多余教学班', 422)
+    closed = [offering_label(db, o) for o in offerings if o.state!='OPEN']
+    require(not closed, 'OFFERING_CLOSED', f'{"、".join(closed)}已关闭或取消，无法继续选择；请刷新目录并移除这些教学班')
     return {o.id:o for o in offerings}
 
 def meetings_conflict(a, b):
@@ -80,18 +113,22 @@ def conflicting(db, offering_id, others):
     mine = [m for m in rows if m.offering_id==offering_id]
     return sorted({b.offering_id for a in mine for b in rows if b.offering_id!=offering_id and meetings_conflict(a,b)})
 
-def prerequisites_met(db, student_id, course_id, term):
+def missing_prerequisites(db, student_id, course_id, term):
     required = set(db.scalars(select(Prerequisite.prerequisite_id).where(Prerequisite.course_id==course_id)))
     if not required:
-        return True
+        return set()
     passed = set(db.scalars(select(Offering.course_id).join(Enrollment, Enrollment.offering_id==Offering.id).join(Semester, Semester.id==Offering.semester_id).where(Enrollment.student_id==student_id, Enrollment.state=='ENROLLED', Enrollment.grade.in_(['A','B','C','D']), Semester.end_date < term.start_date, Semester.end_date < utcnow().date())))
-    return required.issubset(passed)
+    return required - passed
+
+
+def prerequisites_met(db, student_id, course_id, term):
+    return not missing_prerequisites(db, student_id, course_id, term)
 
 def current_enrollments(db, student_id, semester_id):
     return list(db.scalars(select(Enrollment).join(Offering).where(Enrollment.student_id==student_id, Offering.semester_id==semester_id, Enrollment.state=='ENROLLED').order_by(Enrollment.position,Enrollment.id)))
 
 def schedule_view(db, student_id, semester_id):
-    require(db.get(Semester, semester_id), 'SEMESTER_NOT_FOUND', '学期不存在', 404)
+    require(db.get(Semester, semester_id), 'SEMESTER_NOT_FOUND', '未找到所选学期，请刷新学期列表后重新选择', 404)
     row = db.scalar(select(Schedule).where(Schedule.student_id==student_id,Schedule.semester_id==semester_id))
     enrolled = current_enrollments(db, student_id, semester_id)
     alt = list(db.scalars(select(Alternate.offering_id).where(Alternate.schedule_id==row.id).order_by(Alternate.position))) if row else []
@@ -117,9 +154,9 @@ def submit_schedule(db, actor, semester_id, data):
     lock_user(db,actor)
     row = lock_schedule(db,actor,semester_id)
     check_version(row.version,data.version)
-    require(len(data.primary)>=1, 'PRIMARY_REQUIRED','至少选择一个首选教学班',422)
+    require(len(data.primary)>=1, 'PRIMARY_REQUIRED','当前未选择首选教学班，无法提交；请至少添加1个首选，首次提交须选满4个首选和2个备选。若要清空已提交的课表，请使用“删除课表”',422)
     if not row.first_submitted_at:
-        require(len(data.primary)==4 and len(data.alternates)==2,'INITIAL_SELECTION_COUNT','首次提交必须选择4个首选和2个备选',422)
+        require(len(data.primary)==4 and len(data.alternates)==2,'INITIAL_SELECTION_COUNT',f'首次提交必须选择4个首选和2个备选；当前为{len(data.primary)}个首选、{len(data.alternates)}个备选，请补齐后提交，或先保存草稿',422)
     old = current_enrollments(db,actor,semester_id)
     all_ids = sorted(set([e.offering_id for e in old]+data.primary+data.alternates))
     list(db.scalars(select(Offering).where(Offering.id.in_(all_ids)).order_by(Offering.id).with_for_update()))
@@ -127,10 +164,20 @@ def submit_schedule(db, actor, semester_id, data):
     old_ids = {e.offering_id for e in old}
     for oid in data.primary:
         offer = offers[oid]
-        require(prerequisites_met(db,actor,offer.course_id,term),'PREREQUISITE_NOT_MET','未满足所选课程的先修要求',details={'offering_id':oid})
-        require(oid in old_ids or offer.enrolled_count<offer.capacity,'COURSE_FULL','教学班已满，请调整选课',details={'offering_id':oid})
+        # The Submit Schedule use case (PDF p. 14) checks prerequisites for
+        # newly selected offerings only. A correction to an old grade must not
+        # prevent unrelated add/drop changes to an already enrolled course.
+        if oid not in old_ids:
+            missing = missing_prerequisites(db,actor,offer.course_id,term)
+            if missing:
+                names = '、'.join(course_label(db, cid) for cid in sorted(missing))
+                raise DomainError('PREREQUISITE_NOT_MET', f'{offering_label(db, offer)}未满足先修要求：{names}尚无符合条件的通过成绩。先修课须在此前已结束的学期取得 A、B、C 或 D；请核对成绩或更换首选，也可先保存草稿', details={'offering_id':oid,'missing_course_ids':sorted(missing)})
+        if oid not in old_ids and offer.enrolled_count>=offer.capacity:
+            raise DomainError('COURSE_FULL', f'{offering_label(db, offer)}已满员（已选{offer.enrolled_count}人／容量{offer.capacity}人，剩余0个名额）；请刷新余量后更换首选，或将其作为备选、先保存草稿', details={'offering_id':oid,'enrolled_count':offer.enrolled_count,'capacity':offer.capacity,'available':0})
         conflicts = conflicting(db,oid,[x for x in data.primary if x!=oid])
-        require(not conflicts,'SCHEDULE_CONFLICT','所选课程上课时间冲突',details={'offering_ids':[oid]+conflicts})
+        if conflicts:
+            names = '、'.join(offering_label(db, offers[x]) for x in conflicts)
+            raise DomainError('SCHEDULE_CONFLICT', f'{offering_label(db, offer)}与{names}上课时间冲突（存在重叠）；请查看课程时间并更换其中一个首选教学班，当前正式课表未改变', details={'offering_ids':[oid]+conflicts})
     # All validation precedes any removal: an unsuccessful update retains the old schedule.
     for e in old:
         if e.offering_id not in data.primary:
@@ -160,7 +207,7 @@ def delete_schedule(db,actor,semester_id,version):
     lock_semester(db,semester_id)
     lock_user(db,actor)
     row = lock_schedule(db,actor,semester_id)
-    require(not row.deleted and row.version>0,'SCHEDULE_NOT_FOUND','未找到课表',404)
+    require(not row.deleted and row.version>0,'SCHEDULE_NOT_FOUND','当前学期没有可删除的课表，可能尚未保存或已被删除；请刷新页面确认',404)
     check_version(row.version,version)
     old = current_enrollments(db,actor,semester_id)
     list(db.scalars(select(Offering).where(Offering.id.in_([e.offering_id for e in old])).order_by(Offering.id).with_for_update()))
@@ -180,18 +227,23 @@ def update_teaching(db,actor,semester_id,data):
     lock_user(db,actor)
     old = list(db.scalars(select(Offering).where(Offering.semester_id==semester_id,Offering.professor_id==actor)))
     old_ids = {o.id for o in old}
-    require(old_ids==set(data.expected_ids),'VERSION_CONFLICT','任课安排已改变，请刷新重试')
-    require(len(set(data.offering_ids))==len(data.offering_ids),'DUPLICATE_OFFERING','教学班重复',422)
+    require(old_ids==set(data.expected_ids),'VERSION_CONFLICT','本次任课修改未保存：任课安排已被其他操作更新。请刷新查看最新安排，再重新选择教学班')
+    require(len(set(data.offering_ids))==len(data.offering_ids),'DUPLICATE_OFFERING','任课列表中存在重复教学班；每个教学班只能选择一次，请移除重复项后重试',422)
     offers = list(db.scalars(select(Offering).where(Offering.id.in_(sorted(old_ids|set(data.offering_ids)))).order_by(Offering.id).with_for_update().execution_options(populate_existing=True)))
     selected = {o.id:o for o in offers if o.id in data.offering_ids}
-    require(len(selected)==len(data.offering_ids),'INVALID_OFFERING','教学班不存在',422)
+    require(len(selected)==len(data.offering_ids),'INVALID_OFFERING','部分所选教学班已不存在，无法保存任课安排；请刷新课程目录后重新选择',422)
     qualified = set(db.scalars(select(Qualification.course_id).where(Qualification.professor_id==actor)))
     for oid,o in selected.items():
-        require(o.semester_id==semester_id and o.state=='OPEN','OFFERING_CLOSED','教学班不属于开放学期')
-        require(o.course_id in qualified,'NOT_QUALIFIED','不具备该课程的授课资格',403)
-        require(o.professor_id in {None,actor},'PROFESSOR_ASSIGNED','该教学班已由其他教授认领')
+        if o.semester_id!=semester_id or o.state!='OPEN':
+            raise DomainError('OFFERING_CLOSED', f'{offering_label(db, o)}不属于当前所选的开放学期，或已关闭、取消；请刷新课程目录并选择开放的教学班')
+        if o.course_id not in qualified:
+            raise DomainError('NOT_QUALIFIED', f'您尚未获得{course_label(db, o.course_id)}的授课资格，不能选择教学班 {o.code}；请联系教务管理员核对任课资格', 403)
+        if o.professor_id not in {None,actor}:
+            raise DomainError('PROFESSOR_ASSIGNED', f'{offering_label(db, o)}已由其他教授认领；请刷新任课列表并选择尚未认领的教学班')
         conflicts=conflicting(db,oid,[i for i in selected if i!=oid])
-        require(not conflicts,'TEACHING_CONFLICT',f'教学班 {o.code} 与 {"、".join(selected[i].code for i in conflicts)} 授课时间冲突',details={'offering_ids':[oid]+conflicts})
+        if conflicts:
+            names = '、'.join(offering_label(db, selected[i]) for i in conflicts)
+            raise DomainError('TEACHING_CONFLICT', f'{offering_label(db, o)}与{names}授课时间冲突（存在重叠）；请查看上课时间并取消其中一个教学班的选择，原任课安排未改变', details={'offering_ids':[oid]+conflicts})
     for o in offers:
         if o.id in selected:
             o.professor_id = actor

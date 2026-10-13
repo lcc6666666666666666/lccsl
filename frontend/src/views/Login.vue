@@ -12,8 +12,8 @@ async function submit(){
   error.value='';busy.value=true
   try{
     if(changing.value){
-      if(form.newPassword.length<12)throw new Error('新密码至少需要12个字符')
-      if(form.newPassword!==form.confirm)throw new Error('两次输入的新密码不一致')
+      if(form.newPassword.length<12)throw new Error(`新密码至少需要12个字符，当前为${form.newPassword.length}个字符，请补充后再提交。`)
+      if(form.newPassword!==form.confirm)throw new Error('确认新密码与新密码不一致，请重新输入相同的密码；可点击密码框中的显示按钮进行核对。')
       await api('/auth/password','POST',{old_password:form.password,new_password:form.newPassword})
       form.password='';form.newPassword='';form.confirm=''
       auth.setUser(null);ElMessage.success('密码已更新，请使用新密码登录');await router.push('/login')

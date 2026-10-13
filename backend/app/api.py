@@ -7,10 +7,11 @@ from sqlalchemy import select, func, delete, text
 from sqlalchemy.orm import Session
 from .db import get_db, utcnow
 from .models import User, LoginSession, Semester, Course, Offering, Meeting, Prerequisite, Qualification, Schedule, Enrollment, Alternate, Invoice, Outbox, Audit
-from .schemas import Login, PasswordChange, ScheduleInput, VersionInput, TeachingInput, GradesInput, PersonCreate, PersonInput, SemesterInput
-from .security import principal, role, authenticate, public_user, digest, password_hasher, encrypt_identity, identity_fingerprint, masked_identity
+from .schemas import Login, PasswordChange, ScheduleInput, VersionInput, TeachingInput, GradesInput, PersonCreate, PersonInput, SemesterInput, validate_identity_number
+from .security import principal, role, authenticate, public_user, digest, password_hasher, encrypt_identity, identity_fingerprint, masked_identity, decrypt_identity
 from .errors import require, DomainError
 from .catalog import ensure_catalog,offering_structure
+from .validation_messages import field_detail
 from . import services as svc
 
 router = APIRouter(prefix='/api/v1')
@@ -44,8 +45,10 @@ def logout(p:P,request:Request,response:Response,db:DB):
 @router.post('/auth/password')
 def change_password(data:PasswordChange,p:P,db:DB,response:Response):
     user=svc.lock_user(db,p.id)
-    require(password_hasher.verify(data.old_password,user.password_hash),'PASSWORD_INVALID','原密码错误',400)
-    require(data.new_password!=data.old_password,'PASSWORD_UNCHANGED','新密码不能与原密码相同',422)
+    require(password_hasher.verify(data.old_password,user.password_hash),'PASSWORD_INVALID','原密码不正确，请检查大小写后重新输入；忘记密码请联系教务管理员重置',400,
+            [field_detail('body.old_password','原密码不正确，请重新输入；忘记密码请联系教务管理员重置')])
+    require(data.new_password!=data.old_password,'PASSWORD_UNCHANGED','新密码不能与原密码相同，请设置12～128个字符的新密码',422,
+            [field_detail('body.new_password','新密码不能与原密码相同，请更换一个新密码')])
     user.password_hash=password_hasher.hash(data.new_password)
     user.must_change_password=False
     db.execute(delete(LoginSession).where(LoginSession.user_id==p.id))
@@ -123,7 +126,7 @@ def remove_schedule(semester_id:int,data:VersionInput,p:P,db:DB):
 def report(p:P,db:DB,semester_id:int|None=None):
     role(p,'student')
     term=db.get(Semester,semester_id) if semester_id else db.scalar(select(Semester).where(Semester.end_date<utcnow().date()).order_by(Semester.end_date.desc()))
-    require(term and term.end_date<utcnow().date(),'NO_REPORT_CARD','没有已结束学期的成绩信息',404)
+    require(term and term.end_date<utcnow().date(),'NO_REPORT_CARD','所选学期不存在或尚未结束，暂不能查看成绩单。请选择已结束的学期；没有已结束学期时请等待学期结束',404)
     rows=db.execute(select(Enrollment,Offering,Course).join(Offering,Offering.id==Enrollment.offering_id).join(Course,Course.id==Offering.course_id).where(Enrollment.student_id==p.id,Enrollment.state=='ENROLLED',Offering.semester_id==term.id)).all()
     return {'semester':term_view(term),'items':[{'offering_id':o.id,'course':c.name,'code':c.code,'credits':str(c.credits),'grade':e.grade} for e,o,c in rows]}
 
@@ -147,7 +150,7 @@ def set_teaching(semester_id:int,data:TeachingInput,p:P,db:DB):
 def roster(offering_id:int,p:P,db:DB):
     role(p,'professor')
     o=db.get(Offering,offering_id)
-    require(o and o.professor_id==p.id,'OFFERING_NOT_FOUND','教学班不存在或不属于本人',404)
+    require(o and o.professor_id==p.id,'OFFERING_NOT_FOUND','教学班不存在或不属于本人，请刷新本人授课列表并重新选择教学班',404)
     term=db.get(Semester,o.semester_id)
     rows=db.execute(select(Enrollment,User).join(User,User.id==Enrollment.student_id).where(Enrollment.offering_id==o.id,Enrollment.state=='ENROLLED').order_by(User.id)).all()
     return {'can_grade':term.end_date<utcnow().date() and o.state=='CLOSED','items':[{'student_id':u.id,'name':u.name,'username':u.username,'grade':e.grade,'version':e.grade_version} for e,u in rows]}
@@ -157,13 +160,15 @@ def grades(offering_id:int,data:GradesInput,p:P,db:DB):
     role(p,'professor')
     svc.lock_user(db,p.id)
     o=db.scalar(select(Offering).where(Offering.id==offering_id).with_for_update())
-    require(o and o.professor_id==p.id,'OFFERING_NOT_FOUND','教学班不存在或不属于本人',404)
+    require(o and o.professor_id==p.id,'OFFERING_NOT_FOUND','教学班不存在或不属于本人，请刷新本人授课列表并重新选择教学班',404)
     term=db.get(Semester,o.semester_id)
-    require(term.end_date<utcnow().date() and o.state=='CLOSED','GRADING_NOT_OPEN','只能录入本人已结束教学班的成绩')
-    require(len({v.student_id for v in data.grades})==len(data.grades),'DUPLICATE_STUDENT','学生重复',422)
+    require(term.end_date<utcnow().date() and o.state=='CLOSED','GRADING_NOT_OPEN','该教学班尚未满足成绩录入条件：必须已结束选课且学期已经结束。请选择本人已结束学期的教学班')
+    require(len({v.student_id for v in data.grades})==len(data.grades),'DUPLICATE_STUDENT','成绩列表中同一学生出现多次，每名学生只能提交一条成绩。请刷新名单后重新填写',422,
+            [field_detail('body.grades','成绩列表中存在重复学生，请删除重复记录后提交')])
     for value in sorted(data.grades,key=lambda v:v.student_id):
         e=db.scalar(select(Enrollment).where(Enrollment.student_id==value.student_id,Enrollment.offering_id==o.id,Enrollment.state=='ENROLLED').with_for_update())
-        require(e,'STUDENT_NOT_ENROLLED','学生不在该教学班名单中',422)
+        require(e,'STUDENT_NOT_ENROLLED','成绩列表包含不在该教学班正式名单中的学生，相关成绩均未保存。请刷新名单后重新录入',422,
+                [field_detail('body.grades','成绩列表包含未在本教学班正式注册的学生，请刷新名单后重试')])
         svc.check_version(e.grade_version,value.version)
         e.grade=value.grade
         e.grade_version += 1
@@ -171,47 +176,81 @@ def grades(offering_id:int,data:GradesInput,p:P,db:DB):
     db.commit()
     return roster(offering_id,p,db)
 
+def existing_valid_identity(u):
+    # Legacy demo records may predate identity validation. Keep them editable,
+    # but expose a correction flag and never accept a new malformed number.
+    value = decrypt_identity(u.identity_cipher)
+    try:
+        return validate_identity_number(value)
+    except ValueError:
+        return None
+
 def person_view(db,u):
+    identity = existing_valid_identity(u)
     return {**public_user(u),'birth_date':u.birth_date,'identity_masked':masked_identity(u.identity_cipher),
+            'identity_needs_correction':not identity or not u.birth_date or identity[6:14]!=u.birth_date.strftime('%Y%m%d'),
             'status':u.status,'department':u.department,'graduation_date':u.graduation_date,'active':u.active,'version':u.version,
             'qualification_ids':list(db.scalars(select(Qualification.course_id).where(Qualification.professor_id==u.id))) if u.role=='professor' else []}
 
 @router.get('/registrar/people/{kind}')
 def people(kind:str,p:P,db:DB,q:str=Query(default='',max_length=100),page:int=Query(default=1,ge=1),page_size:int=Query(default=20,ge=1,le=100),include_inactive:bool=False):
     role(p,'registrar')
-    require(kind in {'student','professor'},'INVALID_ROLE','人员类型不正确',422)
+    require(kind in {'student','professor'},'INVALID_ROLE','人员类型不正确，只能管理学生或教授。请从学生管理或教授管理页面重新进入',422)
     query=select(User).where(User.role==kind)
     if not include_inactive:
         query=query.where(User.active.is_(True))
     if q:
-        query=query.where(User.name.contains(q,autoescape=True)|User.username.contains(q,autoescape=True)|(User.id==int(q) if q.isdigit() else False))
+        numeric_id = int(q) if q.isascii() and q.isdecimal() else None
+        query=query.where(User.name.contains(q,autoescape=True)|User.username.contains(q,autoescape=True)|(User.id==numeric_id if numeric_id is not None else False))
     total=db.scalar(select(func.count()).select_from(query.subquery()))
     return {'total':total,'items':[person_view(db,u) for u in db.scalars(query.order_by(User.id).offset((page-1)*page_size).limit(page_size))]}
 
 def set_person(db,u,data):
+    if not data.identity_number:
+        existing = existing_valid_identity(u)
+        require(not existing or existing[6:14]==data.birth_date.strftime('%Y%m%d'),
+                'IDENTITY_BIRTH_DATE_MISMATCH','出生日期与已保存的身份证号码不一致，请核对出生日期或重新填写身份证号码',422,
+                [field_detail('body.birth_date','出生日期与已保存的身份证号码不一致，请核对出生日期；如原号码有误，请同时重新填写完整身份证号码')])
     u.name,u.birth_date,u.status=data.name,data.birth_date,data.status
     if data.identity_number:
+        # Older versions could fingerprint a lowercase x. Check both forms;
+        # the unique canonical fingerprint still guards simultaneous writes.
+        fingerprints={identity_fingerprint(data.identity_number),identity_fingerprint(data.identity_number.lower())}
+        duplicate=db.scalar(select(User.id).where(User.identity_fingerprint.in_(fingerprints),User.id!=u.id).limit(1))
+        require(not duplicate,'IDENTITY_ALREADY_EXISTS','身份证号码已登记（包括已停用人员），请核对号码或编辑原有人员记录',409,
+                [field_detail('body.identity_number','身份证号码已登记（包括已停用人员），请核对号码或编辑原有人员记录')])
         u.identity_cipher=encrypt_identity(data.identity_number)
         u.identity_fingerprint=identity_fingerprint(data.identity_number)
     if u.role=='professor':
-        require(bool(data.department),'DEPARTMENT_REQUIRED','教授必须填写所属院系',422)
+        require(bool(data.department),'DEPARTMENT_REQUIRED','教授必须填写所属院系，请填写院系名称后保存',422,
+                [field_detail('body.department','教授的所属院系不能为空，请填写院系名称')])
         u.department=data.department
-        require(len(set(data.qualification_ids))==len(data.qualification_ids),'DUPLICATE_QUALIFICATION','任课资格重复',422)
+        require(len(set(data.qualification_ids))==len(data.qualification_ids),'DUPLICATE_QUALIFICATION','任课资格包含重复课程，同一课程只能选择一次，请删除重复项',422,
+                [field_detail('body.qualification_ids','任课资格包含重复课程，请为每门课程只保留一项')])
         valid=set(db.scalars(select(Course.id).where(Course.id.in_(data.qualification_ids))))
-        require(valid==set(data.qualification_ids),'INVALID_QUALIFICATION','任课资格包含不存在的课程',422)
+        require(valid==set(data.qualification_ids),'INVALID_QUALIFICATION','任课资格包含不存在的课程，请刷新课程目录后重新选择',422,
+                [field_detail('body.qualification_ids','所选任课资格包含不存在的课程，请刷新目录后重新选择')])
         assigned=set(db.scalars(select(Offering.course_id).join(Semester).where(Offering.professor_id==u.id,Semester.state=='OPEN')))
-        require(assigned.issubset(valid),'QUALIFICATION_IN_USE','请先取消相关任课，再移除任课资格')
+        require(assigned.issubset(valid),'QUALIFICATION_IN_USE','要移除的任课资格仍用于开放选课学期的教学班，请先取消相关任课，再移除任课资格',409,
+                [field_detail('body.qualification_ids','要移除的资格仍在使用，请先取消开放选课学期的相关任课')])
         db.execute(delete(Qualification).where(Qualification.professor_id==u.id))
         for cid in valid:
             db.add(Qualification(professor_id=u.id,course_id=cid))
     else:
+        require(not data.qualification_ids,'INVALID_QUALIFICATION','学生不能设置教授任课资格，请清空任课资格后保存',422,
+                [field_detail('body.qualification_ids','学生的任课资格必须为空，请清空此项')])
+        u.department=data.department
         u.graduation_date=data.graduation_date
 
 @router.post('/registrar/people/{kind}')
 def create_person(kind:str,data:PersonCreate,p:P,db:DB):
     role(p,'registrar')
-    require(kind in {'student','professor'},'INVALID_ROLE','人员类型不正确',422)
-    require(data.identity_number,'IDENTITY_REQUIRED','请输入身份号码',422)
+    require(kind in {'student','professor'},'INVALID_ROLE','人员类型不正确，只能添加学生或教授。请从对应管理页面重新进入',422)
+    require(data.identity_number,'IDENTITY_REQUIRED','新增人员必须填写18位身份证号码，请填写完整号码',422,
+            [field_detail('body.identity_number','新增人员必须填写18位身份证号码')])
+    duplicate_username=db.scalar(select(User.id).where(User.username==data.username.lower()).limit(1))
+    require(duplicate_username is None,'USERNAME_ALREADY_EXISTS','登录账号已被使用（包括已停用账号），请更换一个账号；账号不区分大小写',409,
+            [field_detail('body.username','登录账号已被使用（包括已停用账号），请更换一个账号；账号不区分大小写')])
     password=secrets.token_urlsafe(18)
     u=User(username=data.username.lower(),name=data.name,role=kind,password_hash=password_hasher.hash(password),active=True,must_change_password=True)
     db.add(u)
@@ -231,7 +270,7 @@ def lock_person_mutation(db,user_id):
 def update_person(user_id:int,data:PersonInput,p:P,db:DB):
     role(p,'registrar')
     u=lock_person_mutation(db,user_id)
-    require(u.role in {'student','professor'},'PERSON_NOT_FOUND','人员不存在',404)
+    require(u.role in {'student','professor'},'PERSON_NOT_FOUND','该记录不是可管理的学生或教授，请刷新人员列表后重新选择',404)
     svc.check_version(u.version,data.version)
     set_person(db,u,data)
     u.version += 1
@@ -243,7 +282,7 @@ def update_person(user_id:int,data:PersonInput,p:P,db:DB):
 def deactivate(user_id:int,data:VersionInput,p:P,db:DB):
     role(p,'registrar')
     u=lock_person_mutation(db,user_id)
-    require(u.role in {'student','professor'},'PERSON_NOT_FOUND','人员不存在',404)
+    require(u.role in {'student','professor'},'PERSON_NOT_FOUND','该记录不是可管理的学生或教授，请刷新人员列表后重新选择',404)
     svc.check_version(u.version,data.version)
     terms=list(db.scalars(select(Semester.id).where(Semester.state=='OPEN')))
     if u.role=='student':
@@ -270,7 +309,7 @@ def deactivate(user_id:int,data:VersionInput,p:P,db:DB):
 def reset_password(user_id:int,p:P,db:DB):
     role(p,'registrar')
     u=svc.lock_user(db,user_id)
-    require(u.role in {'student','professor'},'PERSON_NOT_FOUND','人员不存在',404)
+    require(u.role in {'student','professor'},'PERSON_NOT_FOUND','该记录不是可管理的学生或教授，请刷新人员列表后重新选择',404)
     password=secrets.token_urlsafe(18)
     u.password_hash=password_hasher.hash(password)
     u.must_change_password=True
@@ -283,9 +322,12 @@ def update_term(semester_id:int,data:SemesterInput,p:P,db:DB):
     role(p,'registrar')
     t=svc.lock_semester(db,semester_id,close=True)
     svc.check_version(t.version,data.version)
-    require(data.registration_close.date()<=t.end_date,'INVALID_WINDOW','选课结束时间不能晚于学期结束',422)
-    t.registration_open=data.registration_open.astimezone(timezone.utc).replace(tzinfo=None)
-    t.registration_close=data.registration_close.astimezone(timezone.utc).replace(tzinfo=None)
+    registration_open=data.registration_open.astimezone(timezone.utc).replace(tzinfo=None)
+    registration_close=data.registration_close.astimezone(timezone.utc).replace(tzinfo=None)
+    require(registration_close.date()<=t.end_date,'INVALID_WINDOW',f'选课结束时间不能晚于学期结束日期（{t.end_date:%Y-%m-%d}，按UTC日期核对），请提前选课结束时间',422,
+            [field_detail('body.registration_close',f'选课结束时间转换为UTC后的日期不能晚于{t.end_date:%Y-%m-%d}，请调整此项')])
+    t.registration_open=registration_open
+    t.registration_close=registration_close
     t.version+=1
     svc.audit(db,p.id,'UPDATE_REGISTRATION_WINDOW',f'semester:{t.id}')
     return commit(db,term_view(t))
@@ -306,8 +348,8 @@ def outbox(p:P,db:DB,page:int=Query(default=1,ge=1),page_size:int=Query(default=
 def retry(event_id:str,p:P,db:DB):
     role(p,'registrar')
     event=db.get(Outbox,event_id,with_for_update=True)
-    require(event,'EVENT_NOT_FOUND','任务不存在',404)
-    require(event.state=='PENDING','EVENT_NOT_PENDING','只能重试等待中的任务')
+    require(event,'EVENT_NOT_FOUND','计费任务不存在，请刷新计费发送列表后重新选择',404)
+    require(event.state=='PENDING','EVENT_NOT_PENDING','该计费任务当前不是等待发送状态，可能已发送成功或正在处理中。请刷新列表查看状态；已成功的任务无需重试')
     event.next_attempt=utcnow()
     svc.audit(db,p.id,'RETRY_BILLING',f'event:{event_id}')
     return commit(db,{'ok':True})

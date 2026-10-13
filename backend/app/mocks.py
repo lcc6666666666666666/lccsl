@@ -14,7 +14,7 @@ catalog_app=FastAPI(title='旧课程目录模拟服务',docs_url=None,redoc_url=
 billing_app=FastAPI(title='计费模拟服务',docs_url=None,redoc_url=None)
 
 async def guard(service,key):
-    if not key or not hmac.compare_digest(key,settings().integration_key):
+    if not key or not hmac.compare_digest(key.encode(),settings().integration_key.encode()):
         raise HTTPException(403,'Unauthorized integration')
     directory=Path(settings().mock_state_dir) if settings().mock_state_dir else PROJECT/'.runtime'
     path=directory/f'{service}-mode.json'
@@ -44,7 +44,8 @@ def accept_event(event):
     if event.kind not in {'RegistrationUpdated','InvoiceFinalized'}:
         raise HTTPException(422,'Unknown event kind')
     payload=event.payload
-    if not isinstance(payload.get('student_id'),int) or not isinstance(payload.get('semester_id'),int):
+    if any(type(payload.get(field)) is not int or not 0 < payload[field] <= 2147483647
+           for field in ('student_id','semester_id')):
         raise HTTPException(422,'Invalid identity')
     fingerprint=hashlib.sha256(json.dumps(event.model_dump(),sort_keys=True,ensure_ascii=False).encode()).hexdigest()
     with SessionLocal() as db:

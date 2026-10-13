@@ -5,6 +5,7 @@ from sqlalchemy import select
 from .db import utcnow
 from .models import User, Semester, Course, Offering, Meeting, Prerequisite, Qualification, Schedule, Enrollment, Alternate, LegacyCatalog
 from .security import password_hasher, encrypt_identity, identity_fingerprint
+from .schemas import identity_check_character
 
 COURSES=[('CS101','程序设计基础'),('MA101','离散数学'),('CS103','计算机导论'),('EN101','大学英语'),
          ('MA102','线性代数'),('SE101','软件工程导论'),('CS201','数据结构'),('CS202','数据库原理'),
@@ -20,9 +21,12 @@ def seed_demo(db, test_password=None):
     test_hash=password_hasher.hash(test_password) if test_password else None
     def user(uid,username,name,role):
         password=test_password or secrets.token_urlsafe(18)
-        identity=f'DEMO-{uid:06d}'
+        # Synthetic fixtures only; these numbers do not represent verified people.
+        birthday=date(1980 if role!='student' else 2004,1,1)
+        identity_body=f'110101{birthday:%Y%m%d}{uid:03d}'
+        identity=identity_body+identity_check_character(identity_body)
         db.add(User(id=uid,username=username,name=name,role=role,password_hash=test_hash or password_hasher.hash(password),
-            birth_date=date(1980 if role!='student' else 2004,1,1),identity_cipher=encrypt_identity(identity),
+            birth_date=birthday,identity_cipher=encrypt_identity(identity),
             identity_fingerprint=identity_fingerprint(identity),status='在职' if role!='student' else '在籍',
             department='计算机学院' if role=='professor' else None,graduation_date=date(now.year+2,6,30) if role=='student' else None,
             active=True,must_change_password=not bool(test_password)))

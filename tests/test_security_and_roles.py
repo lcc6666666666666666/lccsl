@@ -3,6 +3,7 @@ import pytest
 from sqlalchemy import select,func
 from backend.app.db import utcnow
 from backend.app.models import User,LoginSession,Offering,Enrollment,Audit,Qualification
+from backend.app.schemas import identity_check_character
 from .conftest import TEST_PASSWORD,submit
 
 def test_auth_csrf_origin_validation_and_logout(client):
@@ -64,13 +65,15 @@ def test_cannot_choose_another_student(client):
 @pytest.mark.parametrize('kind',['student','professor'])
 def test_registrar_crud_encrypted_identity(client,db,kind):
     c=client('admin')
-    person={'username':'new_person','name':'新建人员','birth_date':'2000-01-01','identity_number':'PRIVATE-IDENTITY-123456','status':'正常','department':'计算机学院','graduation_date':'2028-06-01','qualification_ids':[1,2] if kind=='professor' else []}
+    identity_body='11010120000101601'
+    identity=identity_body+identity_check_character(identity_body)
+    person={'username':'new_person','name':'新建人员','birth_date':'2000-01-01','identity_number':identity,'status':'正常','department':'计算机学院','graduation_date':'2028-06-01' if kind=='student' else None,'qualification_ids':[1,2] if kind=='professor' else []}
     r=c.post(f'/api/v1/registrar/people/{kind}',json=person)
     assert r.status_code==200,r.text
     data=r.json(); uid=data['person']['id']
-    assert 'initial_password' in data and data['person']['identity_masked'].endswith('3456')
+    assert 'initial_password' in data and data['person']['identity_masked'].endswith(identity[-4:])
     stored=db.get(User,uid)
-    assert stored.identity_cipher!=person['identity_number'] and 'PRIVATE' not in stored.identity_cipher
+    assert stored.identity_cipher!=identity and identity not in stored.identity_cipher
     result=c.get(f'/api/v1/registrar/people/{kind}?q={uid}')
     assert result.json()['total']==1 and person['identity_number'] not in result.text
     body={k:v for k,v in person.items() if k!='username'}
